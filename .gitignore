@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+*.bak_*
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Large forensic evidence dumps & binary captures (generate dynamically via self-test)
+*.raw
+*.dd
+*.pcap
+*.evtx
+*.img
+*.iso
+*.vmdk
+*.bin
+
+# Temporary test outputs & local test bundles
+*_selftest/
+test_output/
+sutra_out/
+legal_package/
+real_case/
+*.log
+*.tmp
+
+# Scratch directories
+prototype/try/
+scratch/
