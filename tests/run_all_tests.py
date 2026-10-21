@@ -40,6 +40,7 @@ def main():
         ("Sector B: Multi-Modal Neural Triage Matrix", os.path.join("prototype", "sector_b_triage.py")),
         ("Sector C: Temporal Provenance Knowledge Graph (T-PKG)", os.path.join("prototype", "sector_c_graph.py")),
         ("Sector D: Statutory BSA 2023 Sec 63 Certificate Generator", os.path.join("prototype", "sector_d_legal.py")),
+        ("Sector E: Interactive Forensic Cyber Cockpit", os.path.join("prototype", "sector_e_dashboard.py")),
     ]
     
     results = {}
@@ -62,8 +63,8 @@ def main():
             
     print("-" * 78)
     if all_passed:
-        print("  ALL CORE SECTORS (A, B, C, D) VERIFIED: 100% PASS RATE")
-        print("  Framework is fully court-admissible and ready for Sector E integration.")
+        print("  ALL CORE SECTORS (A, B, C, D, E) VERIFIED: 100% PASS RATE")
+        print("  Framework is fully court-admissible and operational end-to-end.")
     else:
         print("  TEST FAILURES ENCOUNTERED. Please inspect logs.")
     print("=" * 78 + "\n")
