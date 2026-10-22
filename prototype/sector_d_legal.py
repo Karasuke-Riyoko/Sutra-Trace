@@ -87,11 +87,14 @@ Usage
            [--scenario SUSPECT_HOSTILE] [--track SEC_57_PRIMARY] [--strict]
            [--custodian custodian.json] [--expert expert.json] [--out legal_package]
     python sector_d_legal.py --verify-qr '<scanned JSON>' --evidence-manifest A.json
+           [--certificate-json certificate_data.json]   (the status and certificate digest
+                                                        are checked only against the latter)
 """
 
 from __future__ import annotations
 
 import base64
+import bisect
 import datetime
 import enum
 import hashlib
@@ -104,6 +107,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -234,6 +238,10 @@ class LegalInputError(ValueError):
     """An input manifest is missing, unreadable or not the expected kind."""
 
 
+class LegalOutputError(OSError):
+    """The legal bundle could not be put in place; the previous bundle in the folder is unchanged."""
+
+
 # --------------------------------------------------------------------------- #
 # Canonical forms and small helpers                                           #
 # --------------------------------------------------------------------------- #
@@ -276,7 +284,8 @@ def _parse_utc(value: Any) -> Optional[datetime.datetime]:
     m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})?$", s)
     if not m:
         return None
-    frac = (m.group(2) or "")[:7]
+    # Python 3.10's fromisoformat takes only 3 or 6 fractional digits: pad (or cut) to microseconds.
+    frac = "." + (m.group(2) or ".")[1:7].ljust(6, "0")
     try:
         dt = datetime.datetime.fromisoformat(m.group(1) + frac + (m.group(3) or "+00:00"))
     except ValueError:
@@ -304,19 +313,87 @@ def ist_date_time(value: Any) -> Tuple[str, str]:
 def _fmt_inr(amount: Any) -> str:
     try:
         v = float(amount)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "INR ?"
-    whole, frac = divmod(round(v * 100), 100)
+    if not math.isfinite(v):
+        return "INR ?"
+    paise = round(abs(v) * 100)          # group the magnitude; floor divmod of a negative would skew it
+    sign = "-" if v < 0 and paise else ""
+    whole, frac = divmod(paise, 100)
     s = str(int(whole))
     if len(s) > 3:  # Indian digit grouping: 12,34,567
         head, tail = s[:-3], s[-3:]
         head = re.sub(r"(\d)(?=(\d{2})+$)", r"\1,", head)
         s = head + "," + tail
-    return f"INR {s}.{int(frac):02d}"
+    return f"INR {sign}{s}.{int(frac):02d}"
 
 
 def _is_hex(s: Any, n: Optional[int] = None) -> bool:
     return isinstance(s, str) and bool(re.fullmatch(r"[0-9a-f]+", s)) and (n is None or len(s) == n)
+
+
+def _as_dict(x: Any) -> Dict[str, Any]:
+    """x when it is a JSON object, else {} (a malformed field is reported, never dereferenced)."""
+    return x if isinstance(x, dict) else {}
+
+
+def _as_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
+
+
+def _is_int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _finite_float(x: Any) -> Optional[float]:
+    """float(x) for a finite int, float or numeric string; None for anything else."""
+    if x is None or isinstance(x, bool) or not isinstance(x, (int, float, str)):
+        return None
+    try:
+        v = float(x)
+    except (ValueError, OverflowError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _txt(x: Any) -> Optional[str]:
+    """A scalar text field: None stays None, anything else becomes its str()."""
+    return None if x is None else x if isinstance(x, str) else str(x)
+
+
+def _json_safe(obj: Any) -> Any:
+    """A copy with NaN / Infinity replaced by None, so canonical_json never fails on it."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+_VPA_RE = re.compile(r"[\w.\-]+@[\w.\-]+")
+
+
+def _xml_text(x: Any) -> str:
+    """Text for an XML element or attribute: characters XML 1.0 cannot carry become U+FFFD."""
+    return _XML_ILLEGAL.sub("\ufffd", str(x))
+
+
+def _console_safe() -> None:
+    """
+    A redirected Windows console (cp1252) cannot encode Devanagari case folders or names: print
+    them escaped instead of dying with UnicodeEncodeError after the outputs were written.
+    """
+    for s in (sys.stdout, sys.stderr):
+        enc = str(getattr(s, "encoding", "") or "").lower().replace("-", "").replace("_", "")
+        if s is None or enc in ("utf8", "utf8sig"):
+            continue
+        try:
+            s.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def _bank_for_ifsc(ifsc: Optional[str]) -> str:
@@ -916,10 +993,16 @@ _HELVETICA_BOLD_W = (
     722, 722, 722, 722, 667, 667, 611, 556, 556, 556, 556, 556, 556, 889, 556, 556, 556, 556, 556, 278, 278, 278, 278,
     611, 611, 611, 611, 611, 611, 611, 584, 611, 611, 611, 611, 611, 556, 611, 556)
 
+def _windows_font_families() -> List[Tuple[str, str, str]]:
+    """Arial with Consolas or Courier New from the Windows font folder (%WINDIR%, any drive)."""
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    fonts = os.path.join(windir, "Fonts")
+    reg, bold = os.path.join(fonts, "arial.ttf"), os.path.join(fonts, "arialbd.ttf")
+    return [(reg, bold, os.path.join(fonts, "consola.ttf")), (reg, bold, os.path.join(fonts, "cour.ttf"))]
+
+
 _FONT_FAMILIES = (
-    # (regular, bold, mono) candidates; the first complete set wins
-    (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\consola.ttf"),
-    (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\cour.ttf"),
+    # (regular, bold, mono) candidates after the Windows ones; the first complete set wins
     ("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
      "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf"),
@@ -1033,6 +1116,7 @@ class FontSet:
             candidates.append(paths)
         if env:
             candidates.append(env.split(os.pathsep if os.pathsep in env and ";" not in env else ";"))
+        candidates.extend(_windows_font_families())
         candidates.extend(_FONT_FAMILIES)
         if embed:
             for fam in candidates:
@@ -1075,6 +1159,20 @@ def pdf_safe(text: Any) -> str:
     s = str(text).replace("\u2192", "->").replace("\u2264", "<=").replace("\u2265", ">=").replace("\u20b9", "INR ")
     s = s.replace("\u2212", "-").replace("\u00a0", " ").replace("\t", " ")
     return s.encode("cp1252", "replace").decode("cp1252")
+
+
+def pdf_unprintable(text: Any) -> str:
+    """The characters of text that pdf_safe cannot print (WinAnsi has no glyph for them)."""
+    s = str(text).replace("\u2192", "").replace("\u2264", "").replace("\u2265", "").replace("\u20b9", "")
+    s = s.replace("\u2212", "").replace("\u00a0", "").replace("\t", "")
+    out = []
+    for ch in s:
+        try:
+            ch.encode("cp1252")
+        except UnicodeEncodeError:
+            if ch not in out:
+                out.append(ch)
+    return "".join(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1672,8 +1770,8 @@ class _Source:
     """Evidence bytes from a path (read-only, streamed) or from memory."""
 
     def __init__(self, src: Union[str, bytes, bytearray, None], label: str = ""):
-        self.src = src
-        self.label = label or (os.path.basename(src) if isinstance(src, str) else "in-memory")
+        self.src = os.fspath(src) if isinstance(src, os.PathLike) else src
+        self.label = label or (os.path.basename(self.src) if isinstance(self.src, str) else "in-memory")
 
     @property
     def available(self) -> bool:
@@ -1710,6 +1808,27 @@ class _Source:
             pos += len(blk)
         return h.hexdigest()
 
+    def sha256_range(self, off: int, length: int) -> Tuple[str, int]:
+        """SHA-256 of length bytes at off, streamed in 4 MB reads: (hex digest, bytes actually read)."""
+        h = hashlib.sha256()
+        if isinstance(self.src, (bytes, bytearray)):
+            mv = memoryview(self.src)[off:off + length]
+            h.update(mv)
+            return h.hexdigest(), len(mv)
+        fd = os.open(self.src, os.O_RDONLY | getattr(os, "O_BINARY", 0))  # type: ignore[arg-type]
+        try:
+            os.lseek(fd, off, os.SEEK_SET)
+            got = 0
+            while got < length:
+                blk = os.read(fd, min(4 * 1024 * 1024, length - got))
+                if not blk:
+                    break
+                h.update(blk)
+                got += len(blk)
+            return h.hexdigest(), got
+        finally:
+            os.close(fd)
+
 
 def rehash_evidence(src: _Source, bad_sectors: Sequence[int] = (), sector_size: int = SECTOR_SIZE,
                     fill: bytes = b"\xDE\xAD\xBE\xEF") -> Dict[str, Any]:
@@ -1719,7 +1838,8 @@ def rehash_evidence(src: _Source, bad_sectors: Sequence[int] = (), sector_size: 
     """
     size = src.size()
     bad = set(int(b) for b in bad_sectors)
-    pattern = (fill * (sector_size // len(fill) + 1))[:sector_size]
+    span = min(sector_size, CHUNK_SIZE)   # a pattern longer than one chunk is never used
+    pattern = (fill * (span // len(fill) + 1))[:span]
     lin, valid, b2b = hashlib.sha256(), hashlib.sha256(), hashlib.blake2b()
     chunk_roots: List[bytes] = []
     for off in range(0, size, CHUNK_SIZE):
@@ -1756,48 +1876,208 @@ def rehash_evidence(src: _Source, bad_sectors: Sequence[int] = (), sector_size: 
             "merkle_root": _merkle_root(chunk_roots).hex()}
 
 
+def _parse_fill(value: Any) -> Optional[bytes]:
+    """Sector A's fill pattern '0xDEADBEEF' as bytes; None when it is not whole hex bytes."""
+    if isinstance(value, str) and re.fullmatch(r"0x(?:[0-9A-Fa-f]{2})+", value):
+        return bytes.fromhex(value[2:])
+    return None
+
+
 def evidence_view(m: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalise a Sector A manifest (current r2 layout, or the older flat demo layout)."""
-    h = m.get("cryptographic_hashes") or {}
-    media = m.get("evidence_media") or {}
-    algs = m.get("hash_algorithms") or {}
-    bsm = m.get("bad_sector_manifest") or {}
-    bnss = m.get("bnss_verification") or {}
-    tree_alg = algs.get("secondary_tree_hash")
+    """
+    Normalise a Sector A manifest (current r2 layout, or the older flat demo layout). Fields of
+    the wrong JSON type are normalised here so nothing downstream dereferences them; the
+    verifier reports each of them as a blocking problem (see _shape_problems).
+    """
+    h = _as_dict(m.get("cryptographic_hashes"))
+    media = _as_dict(m.get("evidence_media"))
+    algs = _as_dict(m.get("hash_algorithms"))
+    bsm = _as_dict(m.get("bad_sector_manifest"))
+    bnss = _as_dict(m.get("bnss_verification"))
+    tree_alg = _txt(algs.get("secondary_tree_hash")) or None
     tree = h.get("blake3_root_dag") if tree_alg == "blake3" else h.get("blake2s_256_fallback") if tree_alg else None
-    anchor = m.get("rfc3161_time_anchor") or {}
+    anchor = _as_dict(m.get("rfc3161_time_anchor"))
+    size = media.get("size_bytes", m.get("file_size_bytes"))
+    if isinstance(size, float) and size.is_integer():
+        size = int(size)
+    sector_size = bsm.get("sector_size_bytes")
+    fill = bsm.get("fill_pattern", "0xDEADBEEF")
+    custody = bnss.get("sec_106_malkhana_seal_ledger")
+    chunk_roots = _as_dict(m.get("merkle_tree")).get("chunk_roots")
     return {
-        "evidence_id": m.get("evidence_id"), "case": m.get("case_reference"), "examiner": m.get("examiner_id"),
-        "workstation": m.get("ingestion_workstation"), "ingested_utc": m.get("ingestion_timestamp_utc"),
-        "filename": media.get("filename") or m.get("evidence_filename"),
-        "size": media.get("size_bytes", m.get("file_size_bytes")),
-        "telemetry": media.get("hardware_telemetry") or {},
-        "sha256": h.get("sha256_linear_primary") or h.get("sha256_primary"),
-        "sha256_valid": h.get("sha256_piecewise_valid_extent"),
-        "blake2b": h.get("blake2b_secondary"),
-        "tree_alg": tree_alg, "tree": tree,
-        "merkle_root": h.get("sha256_merkle_root_4mb") or h.get("merkle_root"),
-        "video_sha": h.get("bnss_105_seizure_video_sha256"),
-        "bound_root": h.get("final_bound_evidence_root"),
-        "master_root": h.get("master_case_root_v3"),
-        "chunk_roots": (m.get("merkle_tree") or {}).get("chunk_roots"),
-        "bad_sectors": list(bsm.get("bad_sectors") or []),
-        "bad_byte_offsets": list(bsm.get("bad_byte_offsets") or []),
+        "evidence_id": _txt(m.get("evidence_id")), "case": _txt(m.get("case_reference")),
+        "examiner": _txt(m.get("examiner_id")),
+        "workstation": _txt(m.get("ingestion_workstation")), "ingested_utc": _txt(m.get("ingestion_timestamp_utc")),
+        "filename": _txt(media.get("filename") or m.get("evidence_filename")),
+        "size": size if size is None or _is_int(size) else _txt(_json_safe(size)),
+        "telemetry": _as_dict(media.get("hardware_telemetry")),
+        "sha256": _txt(h.get("sha256_linear_primary") or h.get("sha256_primary")),
+        "sha256_valid": _txt(h.get("sha256_piecewise_valid_extent")),
+        "blake2b": _txt(h.get("blake2b_secondary")),
+        "tree_alg": tree_alg, "tree": _txt(tree),
+        "merkle_root": _txt(h.get("sha256_merkle_root_4mb") or h.get("merkle_root")),
+        "video_sha": _txt(h.get("bnss_105_seizure_video_sha256")),
+        "bound_root": _txt(h.get("final_bound_evidence_root")),
+        "master_root": _txt(h.get("master_case_root_v3")),
+        "chunk_roots": chunk_roots if isinstance(chunk_roots, list) and all(isinstance(x, str) for x in chunk_roots)
+        else None,
+        "bad_sectors": [x for x in _as_list(bsm.get("bad_sectors")) if _is_int(x) and x >= 0],
+        "bad_byte_offsets": [x for x in _as_list(bsm.get("bad_byte_offsets")) if _is_int(x) and x >= 0],
         "bad_manifest": bsm or None,
-        "sector_size": int(bsm.get("sector_size_bytes") or SECTOR_SIZE),
-        "fill": bytes.fromhex(str(bsm.get("fill_pattern", "0xDEADBEEF"))[2:]) if str(
-            bsm.get("fill_pattern", "0xDEADBEEF")).startswith("0x") else b"\xDE\xAD\xBE\xEF",
+        "sector_size": sector_size if _is_int(sector_size) and sector_size > 0 else SECTOR_SIZE,
+        "fill": _parse_fill(fill) or b"\xDE\xAD\xBE\xEF",
         "video_check": bnss.get("sec_105_video_continuity"),
-        "custody": bnss.get("sec_106_malkhana_seal_ledger"),
-        "tsa_token": m.get("rfc3161_timestamp_token") or anchor.get("tsr_base64"),
-        "tsa_status": anchor.get("status") or ("TOKEN RECORDED" if m.get("rfc3161_timestamp_token") else
-                                               "NOT RECORDED"),
-        "tsa_imprint": anchor.get("message_imprint_sha256"),
-        "admissibility": m.get("admissibility") or {},
-        "manifest_digest": m.get("manifest_canonical_sha256"),
-        "version": m.get("version"),
+        "custody": custody if isinstance(custody, dict) else None,
+        "tsa_token": _txt(m.get("rfc3161_timestamp_token") or anchor.get("tsr_base64")),
+        "tsa_status": _txt(anchor.get("status")) or ("TOKEN RECORDED" if m.get("rfc3161_timestamp_token") else
+                                                    "NOT RECORDED"),
+        "tsa_imprint": _txt(anchor.get("message_imprint_sha256")),
+        "admissibility": _as_dict(m.get("admissibility")),
+        "manifest_digest": _txt(m.get("manifest_canonical_sha256")),
+        "version": _txt(m.get("version")),
         "full_layout": bool(m.get("merkle_tree") and m.get("hash_algorithms")),
     }
+
+
+_A_DIGEST_FIELDS = ("sha256_linear_primary", "sha256_primary", "sha256_piecewise_valid_extent", "blake2b_secondary",
+                    "blake3_root_dag", "blake2s_256_fallback", "sha256_merkle_root_4mb", "merkle_root",
+                    "bnss_105_seizure_video_sha256", "final_bound_evidence_root", "master_case_root_v3")
+_FIN_CATEGORIES = ("RAPID_UPI_SMURFING", "CROSS_CHAIN_BRIDGE", "INVALID_NPCI_RRN")
+_SHAPE_REPORT_MAX = 25
+
+
+def _shape_problems(a: Dict[str, Any], b: Optional[Dict[str, Any]], c: Optional[Dict[str, Any]]) -> List[str]:
+    """
+    Fields Sector D reads whose JSON type is wrong, and NaN / Infinity anywhere (no sector's
+    canonical form allows them). Each is a blocking problem, so a malformed manifest trips
+    NOT_FIT_FOR_FILING instead of crashing the run part-way.
+    """
+    out: List[str] = []
+
+    def bad(doc: str, path: str, why: str) -> None:
+        out.append(f"{doc} field {path} is malformed ({why})")
+
+    def want(doc: str, parent: Dict[str, Any], key: str, path: str, kind: Any, what: str) -> Any:
+        x = parent.get(key)
+        if x is not None and not (isinstance(x, kind) and not isinstance(x, bool)):
+            bad(doc, path, f"expected {what}, found {type(x).__name__}")
+            return None
+        return x
+
+    def obj(doc: str, parent: Dict[str, Any], key: str, path: str) -> Dict[str, Any]:
+        return _as_dict(want(doc, parent, key, path, dict, "an object"))
+
+    def arr(doc: str, parent: Dict[str, Any], key: str, path: str) -> List[Any]:
+        return _as_list(want(doc, parent, key, path, list, "a list"))
+
+    def count(doc: str, parent: Dict[str, Any], key: str, path: str, positive: bool = False) -> None:
+        x = parent.get(key)
+        if x is not None and not (_is_int(x) and (x > 0 if positive else x >= 0)):
+            bad(doc, path, f"expected a {'positive' if positive else 'non-negative'} whole number, found {x!r:.40}")
+
+    def txn(doc: str, t: Dict[str, Any], path: str) -> None:
+        x = t.get("amount_inr")
+        if x is not None and _finite_float(x) is None:
+            bad(doc, path + ".amount_inr", f"expected an amount in rupees, found {x!r:.40}")
+        for k in ("txn_id", "timestamp_utc", "payer_vpa", "payee_vpa", "payee_ifsc"):
+            want(doc, t, k, f"{path}.{k}", str, "text")
+        want(doc, t, "rrn", path + ".rrn", (str, int), "an RRN")
+
+    A, B, C = "Sector A evidence manifest", "Sector B triage manifest", "Sector C incident storyline"
+    for name, doc, canon in ((A, a, canonical_json_a), (B, b, canonical_json), (C, c, canonical_json)):
+        if doc is not None:
+            try:
+                canon(doc)
+            except (ValueError, TypeError):
+                out.append(f"{name} contains NaN or Infinity values, which its canonical form forbids")
+
+    for k in ("evidence_id", "case_reference", "examiner_id", "ingestion_timestamp_utc", "ingestion_workstation",
+              "version", "manifest_canonical_sha256"):
+        want(A, a, k, k, str, "text")
+    h = obj(A, a, "cryptographic_hashes", "cryptographic_hashes")
+    for k in _A_DIGEST_FIELDS:
+        want(A, h, k, "cryptographic_hashes." + k, str, "a hex digest")
+    media = obj(A, a, "evidence_media", "evidence_media")
+    want(A, media, "filename", "evidence_media.filename", str, "text")
+    count(A, media if "size_bytes" in media else a, "size_bytes" if "size_bytes" in media else "file_size_bytes",
+          "evidence_media.size_bytes")
+    obj(A, media, "hardware_telemetry", "evidence_media.hardware_telemetry")
+    algs = obj(A, a, "hash_algorithms", "hash_algorithms")
+    want(A, algs, "secondary_tree_hash", "hash_algorithms.secondary_tree_hash", str, "an algorithm name")
+    roots = obj(A, a, "merkle_tree", "merkle_tree").get("chunk_roots")
+    if roots is not None and not (isinstance(roots, list) and all(_is_hex(r, 64) for r in roots)):
+        bad(A, "merkle_tree.chunk_roots", "expected a list of 64-digit hex SHA-256 roots")
+    bsm = obj(A, a, "bad_sector_manifest", "bad_sector_manifest")
+    count(A, bsm, "sector_size_bytes", "bad_sector_manifest.sector_size_bytes", positive=True)
+    if bsm.get("fill_pattern") is not None and _parse_fill(bsm.get("fill_pattern")) is None:
+        bad(A, "bad_sector_manifest.fill_pattern", f"expected 0x and whole hex bytes, found {bsm.get('fill_pattern')!r:.40}")
+    for k in ("bad_sectors", "bad_byte_offsets"):
+        x = bsm.get(k)
+        if x is not None and not (isinstance(x, list) and all(_is_int(i) and i >= 0 for i in x)):
+            bad(A, "bad_sector_manifest." + k, "expected a list of non-negative whole numbers")
+    want(A, bsm, "manifest_sha256", "bad_sector_manifest.manifest_sha256", str, "a hex digest")
+    bnss = obj(A, a, "bnss_verification", "bnss_verification")
+    vc = obj(A, bnss, "sec_105_video_continuity", "bnss_verification.sec_105_video_continuity")
+    arr(A, vc, "findings", "bnss_verification.sec_105_video_continuity.findings")
+    obj(A, bnss, "sec_106_malkhana_seal_ledger", "bnss_verification.sec_106_malkhana_seal_ledger")
+    adm = obj(A, a, "admissibility", "admissibility")
+    want(A, adm, "status", "admissibility.status", str, "text")
+    arr(A, adm, "blocking_issues", "admissibility.blocking_issues")
+    arr(A, adm, "warnings", "admissibility.warnings")
+    obj(A, a, "rfc3161_time_anchor", "rfc3161_time_anchor")
+
+    if b is not None:
+        obj(B, b, "sector_a_binding", "sector_a_binding")
+        obj(B, b, "summary_metrics", "summary_metrics")
+        for i, ld in enumerate(arr(B, b, "symbolic_anchors", "symbolic_anchors")):
+            lp = f"symbolic_anchors[{i}]"
+            if not isinstance(ld, dict):
+                bad(B, lp, f"expected an object, found {type(ld).__name__}")
+                continue
+            obj(B, ld, "symbolic_anchor", lp + ".symbolic_anchor")
+            d = obj(B, ld, "lead_details", lp + ".lead_details")
+            if ld.get("threat_category") not in _FIN_CATEGORIES:
+                continue
+            dp = lp + ".lead_details"
+            for k in ("inflow", "transaction", "upi"):
+                txn(B, obj(B, d, k, f"{dp}.{k}"), f"{dp}.{k}")
+            for k in ("outflows", "pooled_inflows"):
+                for j, t in enumerate(arr(B, d, k, f"{dp}.{k}")):
+                    if isinstance(t, dict):
+                        txn(B, t, f"{dp}.{k}[{j}]")
+                    else:
+                        bad(B, f"{dp}.{k}[{j}]", f"expected an object, found {type(t).__name__}")
+            want(B, d, "hub_vpa", dp + ".hub_vpa", str, "a VPA")
+            if any(not isinstance(m, str) for m in arr(B, d, "flagged_mules", dp + ".flagged_mules")):
+                bad(B, dp + ".flagged_mules", "expected a list of VPAs")
+            obj(B, d, "chain", dp + ".chain")
+            rv = obj(B, d, "rrn_validation", dp + ".rrn_validation")
+            want(B, rv, "rrn", dp + ".rrn_validation.rrn", (str, int), "an RRN")
+            arr(B, rv, "reasons", dp + ".rrn_validation.reasons")
+        s45 = obj(B, b, "section45_exculpatory_checklist", "section45_exculpatory_checklist")
+        for j, chk in enumerate(arr(B, s45, "checks", "section45_exculpatory_checklist.checks")):
+            if not isinstance(chk, dict):
+                bad(B, f"section45_exculpatory_checklist.checks[{j}]", f"expected an object, found {type(chk).__name__}")
+        for k in ("checks_evaluated", "checks_determined", "supports_attribution", "supports_intrusion_hypothesis"):
+            count(B, s45, k, "section45_exculpatory_checklist." + k)
+        for parent, path in ((s45, "section45_exculpatory_checklist"), (_as_dict(b.get("summary_metrics")),
+                                                                         "summary_metrics")):
+            x = parent.get("trojan_defense_probability")
+            if x is not None and (isinstance(x, (bool, str)) or _finite_float(x) is None):
+                bad(B, path + ".trojan_defense_probability", f"expected a number, found {x!r:.40}")
+
+    if c is not None:
+        obj(C, c, "sector_a_binding", "sector_a_binding")
+        obj(C, c, "sector_b_binding", "sector_b_binding")
+        arr(C, c, "identity_bindings", "identity_bindings")
+        for i, st in enumerate(arr(C, c, "steps", "steps")):
+            if not isinstance(st, dict):
+                bad(C, f"steps[{i}]", f"expected an object, found {type(st).__name__}")
+                continue
+            obj(C, st, "provenance", f"steps[{i}].provenance")
+    if len(out) > _SHAPE_REPORT_MAX:
+        out = out[:_SHAPE_REPORT_MAX - 1] + [f"... and {len(out) - _SHAPE_REPORT_MAX + 1} further malformed field(s)"]
+    return out
 
 
 def _anchor_iter(obj: Any, path: str = "") -> Iterable[Tuple[str, Dict[str, Any]]]:
@@ -2051,7 +2331,7 @@ class EvidenceVerifier:
 
     def run(self) -> Dict[str, Any]:
         v = self.v
-        blocking: List[str] = []
+        blocking: List[str] = _shape_problems(self.a, self.b, self.c)
         notes: List[str] = []
         rows: List[Dict[str, Any]] = []
         rh = None
@@ -2085,6 +2365,10 @@ class EvidenceVerifier:
 
         row("Electronic record (whole image)", "SHA-256", v["sha256"], rh and rh["sha256_linear"], MATCH_EVIDENCE,
             "sha256")
+        if not re.fullmatch(r"[0-9A-Fa-f]{64}", v["sha256"] or ""):
+            # The Schedule's PART A and PART B both state "the HASH value ... is": nothing to state, nothing to sign.
+            blocking.append("No SHA-256 hash value is recorded for the electronic record in the Sector A manifest, so the "
+                            "certificate under Section 63(4)(c) cannot state its hash value")
         if v["bad_sectors"]:
             row("Readable extent (bad sectors excluded)", "SHA-256", v["sha256_valid"], rh and rh["sha256_valid"],
                 MATCH_EVIDENCE, "sha256_valid")
@@ -2096,7 +2380,7 @@ class EvidenceVerifier:
             if v["chunk_roots"] and rh["chunk_roots"] != v["chunk_roots"]:
                 bad = [i for i, (x, y) in enumerate(zip(rh["chunk_roots"], v["chunk_roots"])) if x != y]
                 blocking.append(f"Merkle chunk roots differ for 4 MB chunks {bad}")
-        elif v["chunk_roots"]:
+        elif v["chunk_roots"] and all(_is_hex(x, 64) for x in v["chunk_roots"]):
             merkle_computed = _merkle_root([bytes.fromhex(x) for x in v["chunk_roots"]]).hex()
             merkle_basis = MATCH_RECOMPUTED
         row("Merkle root (RFC 6962, 1 KB leaves)", "SHA-256", v["merkle_root"], merkle_computed, merkle_basis,
@@ -2116,8 +2400,10 @@ class EvidenceVerifier:
                 notes.append(msg)
         vc = v["video_check"]
         if isinstance(vc, dict) and vc.get("verified") is False:
+            found = vc.get("findings")
             blocking.append("Sector A's Section 105 BNSS recording continuity check FAILED: " +
-                            ("; ".join(str(f) for f in (vc.get("findings") or [])) or "no findings recorded"))
+                            ("; ".join(str(f) for f in (found if isinstance(found, list) else [found] if found else []))
+                             or "no findings recorded"))
         elif v["video_sha"] is not None and not isinstance(vc, dict):
             notes.append("Sector A recorded no Section 105 BNSS recording continuity check result.")
         bound_computed = None
@@ -2127,7 +2413,9 @@ class EvidenceVerifier:
             MATCH_RECOMPUTED, "bound_root")
 
         a_verdict: Optional[Tuple[bool, str]] = None
-        if (self.use_sector_a and _sector_a is not None and v["full_layout"] and v["tree_alg"]
+        # Run whenever the full Sector A layout and the image file are present, even if the tree-hash
+        # algorithm was deleted: Sector A then reports why it cannot verify, instead of being skipped.
+        if (self.use_sector_a and _sector_a is not None and v["full_layout"]
                 and isinstance(self.evidence.src, str) and self.evidence.available):
             try:
                 a_verdict = _sector_a.SutraEvidenceVault().verify_integrity(self.evidence.src, self.a)
@@ -2151,18 +2439,33 @@ class EvidenceVerifier:
 
         digests: List[Dict[str, Any]] = []
 
-        def digest(name: str, recorded: Optional[str], computed: Optional[str]) -> None:
+        def digest(name: str, recorded: Any, body: Callable[[], bytes], required: Optional[str] = None) -> None:
             if recorded is None:
                 digests.append({"document": name, "recorded": None, "status": NOT_RECORDED})
-                notes.append(f"{name} carries no self-digest.")
+                if required:
+                    blocking.append(f"{required}{name} carries no self-digest, so it cannot be shown to be unaltered "
+                                    f"since it was written")
+                else:
+                    notes.append(f"{name} carries no self-digest.")
                 return
-            ok = recorded == computed
-            digests.append({"document": name, "recorded": recorded, "status": MATCH_RECOMPUTED if ok else MISMATCH})
+            try:
+                ok = recorded == _sha256_hex(body())
+                why = "self-digest mismatch"
+            except (ValueError, TypeError):   # NaN / Infinity: no canonical form, so no digest can match
+                ok, why = False, "it has no canonical form (NaN or Infinity values)"
+            digests.append({"document": name, "recorded": _txt(recorded), "status": MATCH_RECOMPUTED if ok else MISMATCH})
             if not ok:
-                blocking.append(f"{name} has been altered since it was written (self-digest mismatch)")
+                blocking.append(f"{name} has been altered since it was written ({why})")
 
-        digest("Sector A evidence manifest", v["manifest_digest"],
-               _sha256_hex(canonical_json_a({k: x for k, x in self.a.items() if k != "manifest_canonical_sha256"})))
+        # Sector A always writes its self-digest. A manifest with any part of Sector A's acquisition
+        # layout but no digest has had it removed, which would disable this tripwire: block (and in
+        # strict mode block any manifest without one).
+        a_layout = any(k in self.a for k in ("merkle_tree", "hash_algorithms", "bnss_verification",
+                                             "bad_sector_manifest"))
+        digest("Sector A evidence manifest", self.a.get("manifest_canonical_sha256"),
+               lambda: canonical_json_a({k: x for k, x in self.a.items() if k != "manifest_canonical_sha256"}),
+               required="Sector A's acquisition layout is present but the " if a_layout else
+               "Strict mode: the " if self.strict else None)
         bsm = v["bad_manifest"] or {}
         if (v["bad_sectors"] or v["bad_byte_offsets"]) and not bsm.get("manifest_sha256"):
             blocking.append("Bad-sector manifest lists unreadable sectors but carries no manifest_sha256, so the "
@@ -2170,14 +2473,14 @@ class EvidenceVerifier:
             digests.append({"document": "Bad-sector manifest", "recorded": None, "status": NOT_RECORDED})
         elif bsm.get("manifest_sha256"):
             digest("Bad-sector manifest", bsm.get("manifest_sha256"),
-                   _sha256_hex(canonical_json_a({k: x for k, x in bsm.items() if k != "manifest_sha256"})))
+                   lambda: canonical_json_a({k: x for k, x in bsm.items() if k != "manifest_sha256"}))
         if self.b is not None:
             digest("Sector B triage manifest", self.b.get("manifest_sha256"),
-                   _sha256_hex(canonical_json({k: x for k, x in self.b.items() if k != "manifest_sha256"})))
+                   lambda: canonical_json({k: x for k, x in self.b.items() if k != "manifest_sha256"}))  # type: ignore
         if self.c is not None:
             digest("Sector C incident storyline", self.c.get("storyline_sha256"),
-                   _sha256_hex(canonical_json({k: x for k, x in self.c.items()
-                                               if k not in ("generated_utc", "storyline_sha256")})))
+                   lambda: canonical_json({k: x for k, x in self.c.items()  # type: ignore[union-attr]
+                                           if k not in ("generated_utc", "storyline_sha256")}))
 
         bindings: List[Dict[str, Any]] = []
 
@@ -2187,7 +2490,7 @@ class EvidenceVerifier:
                 blocking.append(f"{check}: {detail}")
 
         if self.b is not None:
-            sab = self.b.get("sector_a_binding") or {}
+            sab = _as_dict(self.b.get("sector_a_binding"))
             bind("Sector B case matches Sector A", self.b.get("case_id") == v["case"],
                  f"{self.b.get('case_id')} / {v['case']}")
             bind("Sector B bound to this Sector A acquisition", sab.get("evidence_id") == v["evidence_id"],
@@ -2196,7 +2499,7 @@ class EvidenceVerifier:
                 bind("Sector B records the same image SHA-256", sab.get("sha256_linear_primary") == v["sha256"],
                      str(sab.get("sha256_linear_primary"))[:16])
         if self.c is not None:
-            sac = self.c.get("sector_a_binding") or {}
+            sac = _as_dict(self.c.get("sector_a_binding"))
             bind("Sector C bound to this Sector A acquisition", sac.get("evidence_id") == v["evidence_id"],
                  f"evidence_id {sac.get('evidence_id')}")
             if sac.get("manifest_canonical_sha256") is not None:
@@ -2204,7 +2507,7 @@ class EvidenceVerifier:
                      sac.get("manifest_canonical_sha256") == v["manifest_digest"],
                      str(sac.get("manifest_canonical_sha256"))[:16])
             if self.b is not None:
-                sbc = self.c.get("sector_b_binding") or {}
+                sbc = _as_dict(self.c.get("sector_b_binding"))
                 bind("Sector C built from this Sector B manifest",
                      sbc.get("manifest_sha256") == self.b.get("manifest_sha256"),
                      str(sbc.get("manifest_sha256"))[:16])
@@ -2213,8 +2516,8 @@ class EvidenceVerifier:
         adm = v["admissibility"] or {}
         if adm.get("status") == "REJECTED_FOR_COURT":
             blocking.append("Sector A assessed the acquisition REJECTED_FOR_COURT: " +
-                            "; ".join(adm.get("blocking_issues") or []))
-        for w in adm.get("warnings") or []:
+                            "; ".join(str(x) for x in _as_list(adm.get("blocking_issues"))))
+        for w in _as_list(adm.get("warnings")):
             notes.append(f"Sector A: {w}")
         if v["bad_sectors"]:
             notes.append(f"{len(v['bad_sectors'])} unreadable sector(s) of {v['sector_size']} bytes were filled with "
@@ -2229,15 +2532,20 @@ class EvidenceVerifier:
                 "video_verified": video_computed is not None and video_computed == v["video_sha"]
                 and not (isinstance(vc, dict) and vc.get("verified") is False)}
 
-    def _resolve(self, name: Optional[str]) -> Optional[_Source]:
+    def _resolve(self, name: Any) -> Optional[_Source]:
+        """
+        A file named by a manifest, looked up only inside the evidence root: absolute, drive, UNC
+        and '..' names never leave it (and never make Windows open an SMB share).
+        """
         if not name:
             return None
         base = os.path.basename(str(name).replace("\\", "/"))
         if self.evidence.available and base == (self.v["filename"] or ""):
             return self.evidence
         if self.root:
-            for cand in (os.path.join(self.root, str(name)), os.path.join(self.root, base)):
-                if os.path.isfile(cand):
+            for rel in (_contained_relpath(name), base):
+                cand = _inside_root(self.root, rel) if rel else None
+                if cand is not None and os.path.isfile(cand):
                     return _Source(cand)
         return None
 
@@ -2245,48 +2553,98 @@ class EvidenceVerifier:
         seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         refs: List[Tuple[str, str, Dict[str, Any]]] = []
         if self.b is not None:
-            for lead in self.b.get("symbolic_anchors") or []:
-                for path, anc in _anchor_iter(lead):
-                    refs.append(("B", f"{lead.get('lead_id')}:{path}", anc))
+            for lead in _as_list(self.b.get("symbolic_anchors")):
+                if isinstance(lead, dict):
+                    for path, anc in _anchor_iter(lead):
+                        refs.append(("B", f"{lead.get('lead_id')}:{path}", anc))
         if self.c is not None:
-            for st in self.c.get("steps") or []:
-                for path, anc in _anchor_iter(st):
-                    refs.append(("C", f"step {st.get('step')}:{path}", anc))
-            for bnd in self.c.get("identity_bindings") or []:
+            for st in _as_list(self.c.get("steps")):
+                if isinstance(st, dict):
+                    for path, anc in _anchor_iter(st):
+                        refs.append(("C", f"step {st.get('step')}:{path}", anc))
+            for bnd in _as_list(self.c.get("identity_bindings")):
                 for path, anc in _anchor_iter(bnd):
                     refs.append(("C", f"binding:{path}", anc))
-        bad = set(self.v["bad_sectors"])
+        bad = sorted(set(self.v["bad_sectors"]))
         ss = self.v["sector_size"]
         for sector, where, anc in refs:
             name = anc.get("file_path") or anc.get("source_file")
-            key = (os.path.basename(str(name or "")), anc["byte_offset"], anc["length"], anc["sha256"])
+            off, ln, sha = anc["byte_offset"], anc.get("length"), anc.get("sha256")
+            key = (os.path.basename(str(name or "").replace("\\", "/")),) + _anchor_key(anc)
             if key in seen:
                 seen[key]["refs"].append(f"{sector} {where}")
                 continue
             entry = {"file": key[0], "byte_offset": key[1], "length": key[2], "sha256": key[3],
                      "source_type": anc.get("source_type"), "refs": [f"{sector} {where}"]}
-            off, ln = int(anc["byte_offset"]), int(anc["length"])
-            src = self._resolve(name)
-            in_bad = src is self.evidence and any(s in bad for s in range(off // ss, (off + max(ln, 1) - 1) // ss + 1))
-            if src is None:
-                entry["status"] = "UNRESOLVED - source not presented"
-            elif in_bad:
-                entry["status"] = "UNVERIFIABLE - lies in an unreadable sector"
-            else:
-                got = src.read(off, ln)
-                entry["status"] = "MATCH" if len(got) == ln and _sha256_hex(got) == anc["sha256"] else MISMATCH
             seen[key] = entry
+            if not (_is_int(off) and off >= 0 and _is_int(ln) and ln > 0):
+                # A negative offset or a non-positive / non-integer length is not a byte range at all.
+                entry["status"], entry["reason"] = MISMATCH, "is not a valid byte range"
+                continue
+            src = self._resolve(name)
+            if src is None:
+                entry["status"] = ("UNRESOLVED - path outside the evidence root" if name and
+                                   _contained_relpath(name) is None else "UNRESOLVED - source not presented")
+                continue
+            first, last = off // ss, (off + ln - 1) // ss
+            i = bisect.bisect_left(bad, first)
+            if src is self.evidence and i < len(bad) and bad[i] <= last:
+                entry["status"] = "UNVERIFIABLE - lies in an unreadable sector"
+                continue
+            try:
+                size = src.size()
+                if off + ln > size:
+                    entry["status"], entry["reason"] = MISMATCH, f"lies outside its source ({size} bytes)"
+                    continue
+                got, n = src.sha256_range(off, ln)
+            except OSError as e:
+                entry["status"] = f"UNREADABLE - {e}"
+                blocking.append(f"Byte anchor {entry['file']}@{off}+{ln} ({entry['refs'][0]}) could not be read "
+                                f"for re-hashing: {e}")
+                continue
+            entry["status"] = "MATCH" if n == ln and got == sha else MISMATCH
         items = list(seen.values())
         mism = [e for e in items if e["status"] == MISMATCH]
-        unres = [e for e in items if e["status"] != "MATCH" and e["status"] != MISMATCH]
+        unres = [e for e in items if e["status"] != "MATCH" and e["status"] != MISMATCH
+                 and not e["status"].startswith("UNREADABLE")]
         for e in mism:
             blocking.append(f"Byte anchor {e['file']}@{e['byte_offset']}+{e['length']} ({e['refs'][0]}) "
-                            f"does not re-hash to its recorded SHA-256")
+                            + (e.get("reason") or "does not re-hash to its recorded SHA-256"))
         if unres:
             notes.append(f"{len(unres)} of {len(items)} byte anchors could not be re-hashed "
                          f"({unres[0]['status'].split(' - ')[-1]}).")
         return {"total": len(items), "verified": sum(1 for e in items if e["status"] == "MATCH"),
                 "mismatched": len(mism), "unresolved": len(unres), "items": items}
+
+
+def _anchor_key(anc: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    """(byte_offset, length, sha256) of an anchor in a hashable, JSON-safe form."""
+    def k(x: Any) -> Any:
+        return x if x is None or _is_int(x) or isinstance(x, str) else repr(x)
+    return k(anc.get("byte_offset")), k(anc.get("length")), k(anc.get("sha256"))
+
+
+def _contained_relpath(name: Any) -> Optional[str]:
+    """name as a relative path with no drive, root, UNC prefix or '..' part; None if it has one."""
+    s = str(name).replace("\\", "/")
+    if not s or s.startswith("/") or re.match(r"^[A-Za-z]:", s) or ":" in s:
+        return None
+    parts = [p for p in s.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    return os.path.join(*parts)
+
+
+def _inside_root(root: str, rel: str) -> Optional[str]:
+    """root/rel when it really lies inside root after resolving symlinks; None otherwise."""
+    cand = os.path.join(root, rel)
+    try:
+        real_root, real = os.path.realpath(root), os.path.realpath(cand)
+        if os.path.commonpath([real_root, real]) != real_root:
+            return None
+    except (ValueError, OSError):  # different drives on Windows, or an unresolvable path
+        return None
+    return cand
 
 
 # --------------------------------------------------------------------------- #
@@ -2590,7 +2948,55 @@ _DEMO_CASE = {"court": "In the Court of the Chief Judicial Magistrate, Gandhinag
               "seizure_utc": "2026-10-15T05:10:00.000Z",
               "notice_94": "Notice No. CCPS/94/2026/311", "notice_94_utc": "2026-10-16T06:00:00.000Z",
               "entity": "Yes Bank Ltd", "period": "01/09/2026 to 15/10/2026",
-              "io": "Inspector A. K. Rathore", "lab": "NFSU Digital Forensics Laboratory, Gandhinagar"}
+              "io": "Inspector A. K. Rathore (demonstration)", "lab": "NFSU Digital Forensics Laboratory, Gandhinagar"}
+
+
+class _CertificateOverflow(RuntimeError):
+    """A certificate page that does not fit A4 at the smallest type scale."""
+
+    def __init__(self, page: int, message: str):
+        super().__init__(message)
+        self.page = page
+
+
+def _id_runs(ids: Sequence[str]) -> str:
+    """'C01-C06, C13, C14': runs of three or more consecutive check numbers as a range."""
+    nums = sorted({int(i[1:]) for i in ids if re.fullmatch(r"C\d+", i)})
+    if len(nums) != len(set(ids)):
+        return ", ".join(ids)
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out += [f"C{nums[i]:02d}-C{nums[j]:02d}"] if j - i >= 2 else [f"C{n:02d}" for n in nums[i:j + 1]]
+        i = j + 1
+    return ", ".join(out)
+
+
+def _scale_to_cap(amounts: Sequence[float], cap: float) -> List[float]:
+    """
+    Scale amounts down in proportion so they total exactly cap, in whole paise: each share is
+    floored and the paise left over go to the largest remainders, so rounding never lifts the
+    total above the cap.
+    """
+    paise = [max(0, round(a * 100)) for a in amounts]
+    total, cap_p = sum(paise), max(0, round(cap * 100))
+    if total <= cap_p:
+        return [p / 100 for p in paise]
+    shares = [divmod(p * cap_p, total) for p in paise]
+    out = [q for q, _ in shares]
+    for i in sorted(range(len(paise)), key=lambda i: (-shares[i][1], i))[:cap_p - sum(out)]:
+        out[i] += 1
+    return [p / 100 for p in out]
+
+
+def _unverified(reason: str) -> Dict[str, Any]:
+    """A verification result for inputs that could not be verified at all: NOT FIT, with the reason."""
+    return {"status": NOT_FIT, "blocking": [reason], "notes": [], "hash_rows": [], "digests": [], "bindings": [],
+            "anchors": {"total": 0, "verified": 0, "mismatched": 0, "unresolved": 0, "items": []},
+            "sector_a_verifier": None, "rehash": None, "evidence_rehashed": False, "video_presented": False,
+            "video_verified": False}
 
 
 class BSACertificateGenerator:
@@ -2630,18 +3036,30 @@ class BSACertificateGenerator:
                 raise LegalInputError("Sector B triage manifest: no symbolic_anchors")
             if self.c is not None and "steps" not in self.c:
                 raise LegalInputError("Sector C incident storyline: no steps")
-            if evidence_path is None and evidence_root:
-                cand = os.path.join(evidence_root, str(evidence_view(self.a)["filename"] or ""))
-                evidence_path = cand if os.path.isfile(cand) else None
-            if evidence_path is None and isinstance(evidence_manifest, (str, os.PathLike)):
+            # A path the caller names must exist: a typo or an unmounted drive is an error, never a
+            # silent "evidence not presented".
+            for label, given in (("evidence image (evidence_path)", evidence_path),
+                                 ("Section 105 BNSS seizure recording (seizure_video_path)", seizure_video_path)):
+                if given and isinstance(given, (str, os.PathLike)) and not os.path.isfile(given):
+                    raise LegalInputError(f"{label}: file not found: {os.fspath(given)}")
+            if evidence_root and isinstance(evidence_root, (str, os.PathLike)) and not os.path.isdir(evidence_root):
+                raise LegalInputError(f"evidence root: directory not found: {os.fspath(evidence_root)}")
+            # The manifest's file name is only ever looked up inside the folders searched here.
+            fname = os.path.basename(str(evidence_view(self.a)["filename"] or "").replace("\\", "/"))
+            if evidence_path is None and evidence_root and fname:
+                cand = _inside_root(os.fspath(evidence_root), fname)
+                evidence_path = cand if cand is not None and os.path.isfile(cand) else None
+            if evidence_path is None and isinstance(evidence_manifest, (str, os.PathLike)) and fname:
                 base = os.path.dirname(os.path.abspath(os.fspath(evidence_manifest)))
                 for d in (base, os.path.dirname(base)):
-                    cand = os.path.join(d, str(evidence_view(self.a)["filename"] or ""))
-                    if os.path.isfile(cand):
+                    cand = _inside_root(d, fname)
+                    if cand is not None and os.path.isfile(cand):
                         evidence_path = cand
                         break
             if evidence_root is None and isinstance(evidence_path, (str, os.PathLike)):
                 evidence_root = os.path.dirname(os.path.abspath(evidence_path))
+            if isinstance(evidence_root, os.PathLike):
+                evidence_root = os.fspath(evidence_root)
             evidence_src, video_src = evidence_path, seizure_video_path
         self.view = evidence_view(self.a)
         self.evidence = _Source(evidence_src, self.view["filename"] or "")
@@ -2656,6 +3074,13 @@ class BSACertificateGenerator:
         cp = dict(_DEMO_CASE) if self.demo else {}
         cp.update(case_particulars or {})
         self.case = cp
+        # A real manifest certified with the built-in personas is still a demonstration: label every output.
+        self.demo_personas = (not self.demo) and (
+            any(isinstance(custodian, dict) and custodian == p for p in _DEMO_PARTIES.values())
+            or (isinstance(expert, dict) and expert == _DEMO_EXPERT)
+            or (isinstance(case_particulars, dict) and case_particulars == _DEMO_CASE)
+            or any(str(d.get(k) or "").endswith("(demonstration)") for d, k in (
+                (self.custodian, "name"), (self.expert, "name"), (self.case, "io"))))
         if pdf_engine not in ("auto", "reportlab", "pure"):
             raise LegalInputError("pdf_engine must be auto, reportlab or pure")
         if pdf_engine == "reportlab" and not _HAVE_REPORTLAB:
@@ -2673,15 +3098,63 @@ class BSACertificateGenerator:
         self._verification: Optional[Dict[str, Any]] = None
         self._cert: Optional[Dict[str, Any]] = None
         self._qr: Optional[Tuple[List[List[bool]], str, Dict[str, Any]]] = None
+        self._recon_limit: Optional[int] = None
         self.last_render: Dict[str, Any] = {}
 
     # ----- verification and content ---------------------------------------- #
 
     def verify(self) -> Dict[str, Any]:
         if self._verification is None:
-            self._verification = EvidenceVerifier(self.a, self.b, self.c, self.evidence, self.video,
-                                                  self.evidence_root, self.use_sector_a_verifier, self.strict).run()
+            try:
+                ver = EvidenceVerifier(self.a, self.b, self.c, self.evidence, self.video, self.evidence_root,
+                                       self.use_sector_a_verifier, self.strict).run()
+            except Exception as e:  # an input no check anticipated: a NOT FIT tripwire, never a traceback
+                ver = _unverified(f"Sector D could not complete the verification of its inputs "
+                                  f"({type(e).__name__}: {e})")
+            self._generator_findings(ver)
+            ver["status"] = NOT_FIT if ver["blocking"] else (READY_NOTES if ver["notes"] else READY)
+            self._verification = ver
         return self._verification
+
+    PRINTED_FIELDS = (
+        ("custodian", ("name", "relation", "address", "designation", "badge", "police_station", "organisation",
+                       "place")),
+        ("expert", ("name", "qualification", "designation", "laboratory", "accreditation", "notification_79a",
+                    "place", "examiner_reconciliation")),
+        ("case", ("court", "fir", "offences", "seizure_memo", "seizure_place", "search_provision", "notice_94",
+                  "entity", "period", "lab", "malkhana_receipt", "make_model", "colour", "serial_number",
+                  "device_identifier")),
+    )
+
+    def _generator_findings(self, ver: Dict[str, Any]) -> None:
+        """Checks on what PART B certifies and on what the certificate can print, beyond the hashes."""
+        s45 = self.section45_summary()
+        if s45["summary_disagreements"]:
+            ver["blocking"].append("Sector B's Section 45 summary disagrees with its own per-check results: " +
+                                   "; ".join(s45["summary_disagreements"]) + ". The grounds of opinion cannot be "
+                                   "certified from an internally inconsistent triage manifest")
+        elif not s45["ratio_consistent"]:
+            ver["blocking"].append(f"Sector B's trojan_defense_probability {s45['trojan_defense_probability']!r:.24} "
+                                   f"is not intrusion / determined of its own per-check results "
+                                   f"({s45['recomputed_ratio']})")
+        lost = []
+        for group, keys in self.PRINTED_FIELDS:
+            src = {"custodian": self.custodian, "expert": self.expert, "case": self.case}[group]
+            for k in keys:
+                bad = pdf_unprintable(src.get(k)) if src.get(k) not in (None, "") else ""
+                if bad:
+                    lost.append(f"{group}.{k} ({bad[:12]})")
+        v = self.view
+        for k in ("case", "filename", "evidence_id", "workstation", "examiner"):
+            if v[k] and pdf_unprintable(v[k]):
+                lost.append(f"Sector A {k} ({pdf_unprintable(v[k])[:12]})")
+        for k in ("make_model", "colour", "serial_number", "imei"):
+            if v["telemetry"].get(k) not in (None, "") and pdf_unprintable(v["telemetry"].get(k)):
+                lost.append(f"Sector A telemetry {k}")
+        if lost:
+            ver["notes"].append("The certificate font (WinAnsi) cannot print some characters, which would appear as "
+                                "'?' on the signed pages: " + ", ".join(lost) + ". Supply these in Latin script "
+                                "(a transliteration) before signing; certificate_data.json keeps the original text.")
 
     def _party(self, key: str, default: str = BLANK) -> str:
         v = self.custodian.get(key)
@@ -2738,11 +3211,14 @@ class BSACertificateGenerator:
             ]
         elif s == ScenarioType.SUSPECT_HOSTILE:
             paras += [
+                # Section 105 BNSS does not authorise a search; it requires a search under Chapter VII or
+                # Section 185 BNSS, and the seizure made in it, to be recorded by audio-video means.
                 f"The device was seized by me under {LAW['bnss106']} at {self._case('seizure_place')} on {seized_d} "
                 f"at {seized_t} vide seizure memo {self._case('seizure_memo')}, in a search conducted under "
-                f"{LAW['bnss105']}. The search and seizure were recorded by audio-video electronic means" + (f"; the recording bears SHA-256 {video} and is bound to the "
-                                                       f"acquisition by the bound evidence root" if video else
-                                                       "; NO recording hash is bound to this acquisition") +
+                f"{self._case('search_provision', 'Chapter VII or Section 185 of the ' + BNSS)}. As "
+                f"{LAW['bnss105']} requires, the search and seizure were recorded by audio-video electronic means" +
+                (f"; the recording bears SHA-256 {video} and is bound to the acquisition by the bound evidence root"
+                 if video else "; NO recording hash is bound to this acquisition") +
                 f". The device was sealed, deposited in the Malkhana (receipt {receipt}) and sent under seal to "
                 f"{self._case('lab')} for imaging.",
                 f"The device is a seized exhibit produced from proper custody, and the electronic record taken from it "
@@ -2827,9 +3303,9 @@ class BSACertificateGenerator:
         anch = ver["anchors"]
         acq_d, acq_t = ist_date_time(v["ingested_utc"])
         gen_d, _ = ist_date_time(self.generated_utc)
-        hash_para = (f"I state that the HASH value of the electronic / digital record is {v['sha256']}, obtained "
-                     f"through the SHA-256 algorithm, and that the further values in Section 2 were obtained as shown "
-                     f"there. The hash report is enclosed as Annexure H.")
+        hash_para = (f"I state that the HASH value of the electronic / digital record is "
+                     f"{v['sha256'] or NOT_RECORDED}, obtained through the SHA-256 algorithm, and that the further "
+                     f"values in Section 2 were obtained as shown there. The hash report is enclosed as Annexure H.")
         if v["bad_sectors"]:
             hash_para += " " + str(self.bad_sector_disclosure())
         paras = [f"I, {name}, {self.expert.get('designation') or BLANK}, {lab}, do hereby solemnly affirm and "
@@ -2844,7 +3320,7 @@ class BSACertificateGenerator:
                          "; ".join(ver["blocking"][:3]) + ("; and further issues listed in Annexure H"
                                                            if len(ver["blocking"]) > 3 else "") +
                          ". This certificate must not be filed until these are resolved.")
-        elif rows["sha256"]["status"] == MATCH_EVIDENCE:
+        elif ver["evidence_rehashed"]:   # not NOT FIT, so every re-hashed digest matched its recorded value
             text = (f"On {gen_d} I re-computed these values from the acquired image: the SHA-256, BLAKE2b-512 and "
                     f"Merkle root match the values recorded at acquisition on {acq_d} {acq_t}"
                     + (", the Section 105 BNSS recording matches its recorded hash" if not video_provisional and
@@ -2870,6 +3346,13 @@ class BSACertificateGenerator:
         s45 = self.section45_summary()
         if s45["needs_reconciliation"]:
             rec_text = str(self.expert.get("examiner_reconciliation") or "").strip()
+            limit = self._recon_limit
+            if rec_text and limit is not None and len(rec_text) > limit:
+                # Too long for page 2: the certificate carries the opening and points to the full text,
+                # which Annexure X and certificate_data.json (section45) carry unabridged.
+                head = rec_text[:limit].rsplit(" ", 1)[0].rstrip() if limit else ""
+                rec_text = ((head + " ... ") if head else "") + ("[The examiner's reconciliation continues, in full, in "
+                                                                  "Annexure X.]")
             paras.append(f"Section 45 reconciliation: {s45['supports_intrusion_hypothesis']} indicator(s) support an "
                          f"intrusion hypothesis and {s45['undetermined']} could not be determined (Section 3). " +
                          (rec_text if rec_text else
@@ -2888,17 +3371,28 @@ class BSACertificateGenerator:
     S45_LABEL = "Section 45 BSA Exculpatory Indicator Ratio"
 
     def section45_summary(self) -> Dict[str, Any]:
-        s = (self.b or {}).get("section45_exculpatory_checklist") or {}
-        checks = s.get("checks") or []
-        evaluated = s.get("checks_evaluated", len(checks))
-        determined = s.get("checks_determined", sum(1 for c in checks if c.get("result") != "UNDETERMINED"))
-        intr = s.get("supports_intrusion_hypothesis",
-                     sum(1 for c in checks if c.get("result") == "SUPPORTS_INTRUSION_HYPOTHESIS"))
-        attr = s.get("supports_attribution", sum(1 for c in checks if c.get("result") == "SUPPORTS_ATTRIBUTION"))
-        undet = (evaluated - determined) if isinstance(evaluated, int) and isinstance(determined, int) else 0
-        p = s.get("trojan_defense_probability")
-        if p is None:
-            p = (self.b or {}).get("summary_metrics", {}).get("trojan_defense_probability")
+        s = _as_dict((self.b or {}).get("section45_exculpatory_checklist"))
+        checks = [c for c in _as_list(s.get("checks")) if isinstance(c, dict)]
+        # The counts certified in PART B come from the per-check results themselves; Sector B's
+        # summary fields are only compared with them (a disagreement blocks, see summary_disagreements).
+        counted = {"checks_evaluated": len(checks),
+                   "checks_determined": sum(1 for c in checks if c.get("result") != "UNDETERMINED"),
+                   "supports_intrusion_hypothesis": sum(1 for c in checks
+                                                        if c.get("result") == "SUPPORTS_INTRUSION_HYPOTHESIS"),
+                   "supports_attribution": sum(1 for c in checks if c.get("result") == "SUPPORTS_ATTRIBUTION")}
+        summary = {k: s.get(k) for k in counted}
+        if not checks:   # no per-check list: Sector B's summary is all there is (non-counts read as 0)
+            counted = {k: (x if _is_int(x) and x >= 0 else 0) for k, x in summary.items()}
+        disagreements = [f"{k} {summary[k]!r:.20} (listed results give {counted[k]})" for k in counted
+                         if checks and summary[k] is not None and summary[k] != counted[k]]
+        evaluated, determined = counted["checks_evaluated"], counted["checks_determined"]
+        intr, attr = counted["supports_intrusion_hypothesis"], counted["supports_attribution"]
+        undet = max(0, evaluated - determined)
+        p_raw = s.get("trojan_defense_probability")
+        if p_raw is None:
+            p_raw = _as_dict((self.b or {}).get("summary_metrics")).get("trojan_defense_probability")
+        p = p_raw if p_raw is None or (not isinstance(p_raw, (bool, str)) and _finite_float(p_raw) is not None) \
+            else _txt(p_raw)
         recomputed = round(intr / determined, 4) if determined else None
         strict = round(intr / evaluated, 4) if evaluated else None
         upper = round((intr + undet) / evaluated, 4) if evaluated else None
@@ -2922,7 +3416,9 @@ class BSACertificateGenerator:
                 "checks_determined": determined, "supports_attribution": attr, "supports_intrusion_hypothesis": intr,
                 "undetermined": undet, "trojan_defense_probability": p, "recomputed_ratio": recomputed,
                 "exculpatory_indicator_ratio_strict": strict, "exculpatory_indicator_ratio_upper_bound": upper,
-                "ratio_consistent": p is None or recomputed is None or abs(float(p) - recomputed) < 5e-4,
+                "ratio_consistent": p is None or recomputed is None or (
+                    not isinstance(p, str) and abs(float(p) - recomputed) < 5e-4),
+                "summary_disagreements": disagreements,
                 "display": display, "groups": groups, "needs_reconciliation": bool(intr or undet),
                 "examiner_reconciliation": (str(self.expert.get("examiner_reconciliation") or "").strip() or None)
                 if (intr or undet) else None,
@@ -2932,6 +3428,11 @@ class BSACertificateGenerator:
                                 "Sector B's trojan_defense_probability field (intrusion / determined) is kept "
                                 "unchanged in the data for compatibility."),
                 "sector_b_method_note": s.get("method_note"), "checks": checks, "statute": LAW["sec45"]}
+
+    @property
+    def demonstration(self) -> bool:
+        """The built-in case, or any of the built-in demonstration personas (PART A party, expert, case)."""
+        return self.demo or self.demo_personas
 
     def certificate_data(self) -> Dict[str, Any]:
         """Everything the certificate prints, as data; its SHA-256 is the certificate digest in the QR."""
@@ -2943,7 +3444,7 @@ class BSACertificateGenerator:
         st = ver["status"]
         cert = {
             "schema": "SUTRA-BSA63-CERTIFICATE/1", "engine": f"{LEGAL_VERSION} {LEGAL_REVISION}",
-            "generated_utc": self.generated_utc, "demonstration": self.demo,
+            "generated_utc": self.generated_utc, "demonstration": self.demonstration,
             "statute": LAW["schedule"], "scenario": self.scenario.value, "track": self.track.statutory_code,
             "statutory_code": self.track.statutory_code,
             "track_route": self.track.statutory_route, "strict_mode": self.strict, "court": self._case("court", "In the Court of " + BLANK),
@@ -2997,8 +3498,8 @@ class BSACertificateGenerator:
                           "L: Triage leads (Sector B)", "F: Financial trail"] +
                          (["BS: Bad-sector manifest"] if v["bad_sectors"] else []),
         }
-        self._cert = cert
-        return cert
+        self._cert = _json_safe(cert)
+        return self._cert
 
     def certificate_digest(self) -> str:
         return _sha256_hex(canonical_json(self.certificate_data()))
@@ -3020,7 +3521,8 @@ class BSACertificateGenerator:
         return payload
 
     def _qr_bytes(self) -> bytes:
-        return json.dumps(self.generate_qr_payload(), separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        # UTF-8 rather than JSON unicode escapes: a Devanagari character costs 3 bytes in the QR, not 6.
+        return json.dumps(self.generate_qr_payload(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     def qr_matrix(self) -> Tuple[List[List[bool]], str]:
         if self._qr is None:
@@ -3042,16 +3544,36 @@ class BSACertificateGenerator:
             f.write(png)
         return output_path
 
+    QR_REQUIRED = ("statute", "case", "evidence_id", "sha256", "merkle_root", "bound_root", "status", "cert")
+    QR_STATUS = {READY: "READY", READY_NOTES: "NOTES", NOT_FIT: "NOT_FIT"}
+
     @staticmethod
     def verify_qr_payload(payload: Union[str, Dict[str, Any]], evidence_manifest: Any = None,
                           certificate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """What a magistrate's clerk runs on a scanned QR: field-by-field comparison with the manifest."""
-        p = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        """
+        What a magistrate's clerk runs on a scanned QR: field-by-field comparison with the Sector A
+        manifest and / or the certificate JSON. Without either there is nothing to compare, so the
+        payload never verifies on its own; the printed status must match the certificate's.
+        """
+        if isinstance(payload, (str, bytes, bytearray)):
+            try:
+                p = json.loads(payload)
+            except (ValueError, UnicodeDecodeError):
+                return {"fields": {}, "ok": False, "error": "payload is not JSON (mis-scanned or truncated QR?)"}
+        else:
+            p = payload
+        if not isinstance(p, dict):
+            return {"fields": {}, "ok": False, "error": f"payload is not a JSON object ({type(p).__name__})"}
+        p = dict(p)
         out: Dict[str, Any] = {"fields": {}, "ok": True}
-        missing = [k for k in ("statute", "case", "evidence_id", "sha256", "merkle_root", "bound_root") if k not in p]
+        missing = [k for k in BSACertificateGenerator.QR_REQUIRED if k not in p]
         if missing:
             out["ok"] = False
             out["missing"] = missing
+        if evidence_manifest is None and certificate is None:
+            out["ok"] = False
+            out["error"] = ("no reference supplied: give the Sector A evidence manifest and / or the certificate JSON "
+                            "to compare the payload with")
         if evidence_manifest is not None:
             v = evidence_view(_load_json_input(evidence_manifest, "Sector A evidence manifest") or {})
             for k, vk in (("case", "case"), ("evidence_id", "evidence_id"), ("sha256", "sha256"),
@@ -3060,14 +3582,34 @@ class BSACertificateGenerator:
                 if k in p:
                     out["fields"][k] = p[k] == v[vk]
             if v["merkle_root"] and v["bound_root"]:
-                out["fields"]["bound_root_recomputes"] = bound_root(v["merkle_root"], v["video_sha"]) == v["bound_root"]
-        if certificate is not None:
-            out["fields"]["cert"] = p.get("cert") == _sha256_hex(canonical_json(certificate))
+                out["fields"]["bound_root_recomputes"] = (
+                    _is_hex(v["merkle_root"], 64) and (v["video_sha"] is None or _is_hex(v["video_sha"], 64))
+                    and bound_root(v["merkle_root"], v["video_sha"]) == v["bound_root"])
+        if certificate is None:
+            # Only the certificate JSON can confirm the certificate digest and the printed status.
+            out["not_verified"] = ["cert", "status"]
+        else:
+            cert = _as_dict(certificate)
+            try:
+                digest = _sha256_hex(canonical_json(cert))
+            except (ValueError, TypeError):
+                digest = None
+            out["fields"]["cert"] = digest is not None and p.get("cert") == digest
+            want = BSACertificateGenerator.QR_STATUS.get(_as_dict(cert.get("readiness")).get("status"))
+            out["fields"]["status"] = want is not None and p.get("status") == want
+            out["fields"]["certificate_record"] = (
+                p.get("evidence_id") == _as_dict(cert.get("record")).get("evidence_id")
+                and p.get("sha256") == _as_dict(_as_dict(cert.get("part_a")).get("hash_statement")).get("value")
+                and p.get("case") == _as_dict(cert.get("case")).get("case_reference"))
         key = _audit_key()
         if "mac" in p:
             body = {k: x for k, x in p.items() if k != "mac"}
-            out["fields"]["mac"] = bool(key) and hmac.compare_digest(
-                p["mac"], hmac.new(key, canonical_json(body), hashlib.sha256).hexdigest())
+            try:
+                expect = hmac.new(key, canonical_json(body), hashlib.sha256).hexdigest() if key else None
+            except (ValueError, TypeError):
+                expect = None
+            mac = p["mac"]
+            out["fields"]["mac"] = bool(expect and _is_hex(mac, 64) and hmac.compare_digest(mac, expect))
         out["ok"] = out["ok"] and all(out["fields"].values())
         return out
 
@@ -3211,7 +3753,7 @@ class BSACertificateGenerator:
                 size=6.8)
         fl.heading("3. Grounds of opinion: Section 45 BSA 2023 exculpatory indicator screen")
         s45 = cert["part_b"]["section45"]
-        grp = "; ".join(f"{g['group']} ({g['checks'][0]}-{g['checks'][-1]} group, {len(g['checks'])} checks): "
+        grp = "; ".join(f"{g['group']} ({_id_runs(g['checks'])} group, {len(g['checks'])} checks): "
                         f"{g['supports_attribution']} attribution, {g['supports_intrusion_hypothesis']} intrusion, "
                         f"{g['undetermined']} undetermined" for g in s45["groups"] if g["checks"])
         fl.kv([("Points evaluated", f"{s45['checks_evaluated']} (Annexure X lists each check and its result)"),
@@ -3234,17 +3776,41 @@ class BSACertificateGenerator:
                 "Page 2 of 2")
         return not fl.overflow
 
+    RECONCILIATION_LIMITS: Tuple[Optional[int], ...] = (None, 2400, 1600, 1000, 500, 0)
+
     def _layout_certificate(self) -> PageRecorder:
+        """
+        Both pages at the largest type scale (1.0 down to 0.72) that fits A4. When PART B does not
+        fit even then, the examiner's reconciliation is shortened on page 2 and continued in
+        Annexure X; the certificate data (and so the QR digest) are rebuilt to match what is printed.
+        """
+        text = str(self.expert.get("examiner_reconciliation") or "").strip()
+        limits = self.RECONCILIATION_LIMITS
+        last: Optional[_CertificateOverflow] = None
+        for limit in limits[limits.index(self._recon_limit):]:
+            if limit is not None and len(text) <= limit:
+                continue
+            if limit != self._recon_limit:
+                self._recon_limit, self._cert, self._qr = limit, None, None
+            try:
+                return self._layout_pages()
+            except _CertificateOverflow as e:
+                last = e
+                if e.page != 2 or not text or not self.section45_summary()["needs_reconciliation"]:
+                    break
+        raise RuntimeError(str(last) if last else "certificate does not fit A4")
+
+    def _layout_pages(self) -> PageRecorder:
         rec = PageRecorder(self.fonts, PAGE_W, PAGE_H)
-        for draw in (self._draw_part_a, self._draw_part_b):
+        for page, draw in enumerate((self._draw_part_a, self._draw_part_b), 1):
             fs = 1.0
             while True:
                 tmp = PageRecorder(self.fonts, PAGE_W, PAGE_H)
                 if draw(tmp, fs):
                     break
+                if round(fs - 0.04, 2) < 0.7:
+                    raise _CertificateOverflow(page, f"certificate page {page} does not fit A4 even at {fs:.2f} scale")
                 fs = round(fs - 0.04, 2)
-                if fs < 0.7:
-                    raise RuntimeError(f"certificate page {rec.page_no + 1} does not fit A4 even at {fs:.2f} scale")
             rec.pages.append(tmp.pages[0])
             for t in tmp.text_log:
                 rec.text_log.append(dict(t, page=rec.page_no))
@@ -3352,13 +3918,13 @@ class BSACertificateGenerator:
             fl.para("Sector B did not evaluate the Section 45 screen for this case.", size=7)
 
         section("S", "Incident storyline (Sector C), each step anchored to bytes of the evidence")
-        steps = (self.c or {}).get("steps") or []
+        steps = [st for st in _as_list((self.c or {}).get("steps")) if isinstance(st, dict)]
         status_by = {(it["byte_offset"], it["length"], it["sha256"]): it["status"] for it in ver["anchors"]["items"]}
         if steps:
             srows, scol = [], []
             for st in steps:
-                p = st.get("provenance") or {}
-                stat = status_by.get((p.get("byte_offset"), p.get("length"), p.get("sha256")), "not checked")
+                p = _as_dict(st.get("provenance"))
+                stat = status_by.get(_anchor_key(p), "not checked")
                 srows.append((str(st.get("step")), str(st.get("timestamp_utc") or "time unknown")[:23],
                               st.get("narrative") or f"{st.get('actor')} {st.get('action')} {st.get('target')}",
                               f"{p.get('source_type', '')} @{p.get('byte_offset')}+{p.get('length')}",
@@ -3373,12 +3939,12 @@ class BSACertificateGenerator:
             fl.para("No Sector C storyline was supplied.", size=7)
 
         section("L", "Triage leads (Sector B) and their primary byte anchors")
-        leads = (self.b or {}).get("symbolic_anchors") or []
+        leads = [ld for ld in _as_list((self.b or {}).get("symbolic_anchors")) if isinstance(ld, dict)]
         if leads:
             lrows = []
             for ld in leads:
-                an = ld.get("symbolic_anchor") or {}
-                stat = status_by.get((an.get("byte_offset"), an.get("length"), an.get("sha256")), "not checked")
+                an = _as_dict(ld.get("symbolic_anchor"))
+                stat = status_by.get(_anchor_key(an), "not checked")
                 lrows.append((ld.get("lead_id", ""), ld.get("threat_category", ""), ld.get("severity", ""),
                               str(ld.get("threat_score", "")), f"{an.get('source_type', '')} @{an.get('byte_offset')}"
                                                               f"+{an.get('length')}", stat))
@@ -3446,64 +4012,81 @@ class BSACertificateGenerator:
     # ----- Financial: cluster, STR, freeze notice ---------------------------- #
 
     def cluster_data(self) -> Dict[str, Any]:
-        """UPI fan-out legs, onward transfers, invalid RRNs and crypto exits from the Sector B leads."""
+        """
+        UPI fan-out legs, onward transfers, invalid RRNs and crypto exits from the Sector B leads.
+        An RRN that is not 12 digits fails NPCI format validation whether or not Sector B flagged it.
+        """
         legs: Dict[str, Dict[str, Any]] = {}
         hubs: List[str] = []
         mules: List[str] = []
         exits: List[Dict[str, Any]] = []
         invalid: Dict[str, List[str]] = {}
         anchors_by_txn: Dict[str, Dict[str, Any]] = {}
-        victims: List[str] = []
-        for ld in (self.b or {}).get("symbolic_anchors") or []:
-            cat, d = ld.get("threat_category"), ld.get("lead_details") or {}
+        victims: List[Optional[str]] = []
+
+        def add_leg(t: Any, lead_id: Any) -> None:
+            if isinstance(t, dict) and t.get("txn_id") not in (None, ""):
+                tid = _txt(t["txn_id"]) or ""
+                legs.setdefault(tid, dict(t, txn_id=tid, lead_id=lead_id))
+
+        for ld in _as_list((self.b or {}).get("symbolic_anchors")):
+            if not isinstance(ld, dict):
+                continue
+            cat, d = ld.get("threat_category"), _as_dict(ld.get("lead_details"))
             for _p, an in _anchor_iter(ld):
                 if an.get("txn_id"):
-                    anchors_by_txn.setdefault(an["txn_id"], an)
+                    anchors_by_txn.setdefault(_txt(an["txn_id"]) or "", an)
             if cat == "RAPID_UPI_SMURFING":
-                if d.get("hub_vpa") and d["hub_vpa"] not in hubs:
-                    hubs.append(d["hub_vpa"])
-                for m in d.get("flagged_mules") or []:
-                    if m not in mules:
+                hub = _txt(d.get("hub_vpa"))
+                if hub and hub not in hubs:
+                    hubs.append(hub)
+                for m in _as_list(d.get("flagged_mules")):
+                    m = _txt(m)
+                    if m and m not in mules:
                         mules.append(m)
-                for t in [d.get("inflow")] + list(d.get("outflows") or []) + list(d.get("pooled_inflows") or []):
-                    if t and t.get("txn_id"):
-                        legs.setdefault(t["txn_id"], dict(t, lead_id=ld.get("lead_id")))
-                if d.get("inflow") and d["inflow"].get("payer_vpa") not in victims:
-                    victims.append(d["inflow"]["payer_vpa"])
+                for t in [d.get("inflow")] + _as_list(d.get("outflows")) + _as_list(d.get("pooled_inflows")):
+                    add_leg(t, ld.get("lead_id"))
+                inflow = d.get("inflow")
+                if isinstance(inflow, dict) and inflow and _txt(inflow.get("payer_vpa")) not in victims:
+                    victims.append(_txt(inflow.get("payer_vpa")))
             elif cat == "CROSS_CHAIN_BRIDGE":
-                u, ch = d.get("upi") or {}, d.get("chain") or {}
-                if u.get("txn_id"):
-                    legs.setdefault(u["txn_id"], dict(u, lead_id=ld.get("lead_id")))
+                u, ch = _as_dict(d.get("upi")), _as_dict(d.get("chain"))
+                add_leg(u, ld.get("lead_id"))
                 exits.append({"chain": ch.get("chain"), "tx_hash": ch.get("tx_hash"),
                               "from_address": ch.get("from_address"), "to_address": ch.get("to_address"),
                               "amount_usdt": ch.get("amount_usdt"), "timestamp_utc": ch.get("timestamp_utc"),
-                              "upi_txn": u.get("txn_id"), "delta_t_s": d.get("delta_t_s"),
+                              "upi_txn": _txt(u.get("txn_id")), "delta_t_s": d.get("delta_t_s"),
                               "lead_id": ld.get("lead_id")})
             elif cat == "INVALID_NPCI_RRN":
-                t = d.get("transaction") or {}
-                rv = d.get("rrn_validation") or {}
-                if t.get("txn_id"):
-                    legs.setdefault(t["txn_id"], dict(t, lead_id=ld.get("lead_id")))
+                rv = _as_dict(d.get("rrn_validation"))
+                add_leg(d.get("transaction"), ld.get("lead_id"))
                 if rv.get("rrn"):
-                    invalid[rv["rrn"]] = list(rv.get("reasons") or ["failed NPCI RRN validation"])
+                    invalid[_txt(rv["rrn"]) or ""] = ([str(x) for x in _as_list(rv.get("reasons"))]
+                                                      or ["failed NPCI RRN validation"])
         out_legs = []
-        for tid in sorted(legs, key=lambda k: (legs[k].get("timestamp_utc") or "", k)):
+        for tid in sorted(legs, key=lambda k: (_txt(legs[k].get("timestamp_utc")) or "", k)):
             t = legs[tid]
-            a = anchors_by_txn.get(tid) or {}
-            out_legs.append({"txn_id": tid, "timestamp_utc": t.get("timestamp_utc") or "", "payer_vpa": t.get("payer_vpa"),
-                             "payee_vpa": t.get("payee_vpa"), "payee_ifsc": t.get("payee_ifsc"),
-                             "amount_inr": float(t.get("amount_inr") or 0), "rrn": str(t.get("rrn") or ""),
-                             "rrn_valid": str(t.get("rrn")) not in invalid,
-                             "rrn_invalid_reasons": invalid.get(str(t.get("rrn")), []), "lead_id": t.get("lead_id"),
+            a = _as_dict(anchors_by_txn.get(tid))
+            rrn = _txt(t.get("rrn")) or ""
+            amount = _finite_float(t.get("amount_inr"))
+            twelve = re.fullmatch(r"\d{12}", rrn) is not None
+            out_legs.append({"txn_id": tid, "timestamp_utc": _txt(t.get("timestamp_utc")) or "",
+                             "payer_vpa": _txt(t.get("payer_vpa")), "payee_vpa": _txt(t.get("payee_vpa")),
+                             "payee_ifsc": _txt(t.get("payee_ifsc")),
+                             "amount_inr": amount if amount is not None and amount >= 0 else 0.0, "rrn": rrn,
+                             "rrn_valid": rrn not in invalid and twelve,
+                             "rrn_invalid_reasons": invalid.get(rrn) or ([] if twelve else
+                                                                         ["RRN is not 12 digits (NPCI format)"]),
+                             "lead_id": t.get("lead_id"),
                              "anchor": {k: a.get(k) for k in ("file_path", "byte_offset", "length", "sha256")}
                              if a else None})
         onward = [l["payee_vpa"] for l in out_legs
                   if l["payee_vpa"] not in hubs + mules and l["payer_vpa"] in hubs + mules]
         inflow_total = sum(l["amount_inr"] for l in out_legs if l["payee_vpa"] in hubs)
-        return {"hub_vpas": hubs, "hub_vpa": hubs[0] if hubs else None, "victim_vpas": victims, "mule_vpas": mules,
-                "onward_beneficiaries": list(dict.fromkeys(onward)), "legs": out_legs, "crypto_exits": exits,
-                "invalid_rrns": invalid, "total_inflow_inr": round(inflow_total, 2),
-                "rrns": [l["rrn"] for l in out_legs if l["rrn"]]}
+        return _json_safe({"hub_vpas": hubs, "hub_vpa": hubs[0] if hubs else None, "victim_vpas": victims,
+                           "mule_vpas": mules, "onward_beneficiaries": list(dict.fromkeys(onward)), "legs": out_legs,
+                           "crypto_exits": exits, "invalid_rrns": invalid, "total_inflow_inr": round(inflow_total, 2),
+                           "rrns": [l["rrn"] for l in out_legs if l["rrn"]]})
 
     def generate_fiu_ind_str_xml(self, cluster_data: Optional[Dict[str, Any]] = None,
                                  output_path: Optional[str] = None,
@@ -3516,9 +4099,10 @@ class BSACertificateGenerator:
         root = ET.Element(q("FINnet2_STR"), {"version": "2.0", "generator": f"{LEGAL_VERSION} {LEGAL_REVISION}"})
 
         def sub(parent: ET.Element, tag: str, text: Any = None, **attrs: Any) -> ET.Element:
-            el = ET.SubElement(parent, q(tag), {k: str(x) for k, x in attrs.items() if x is not None})
+            # Seized logs can carry control characters XML 1.0 cannot hold: shown as U+FFFD, never dropped.
+            el = ET.SubElement(parent, q(tag), {k: _xml_text(x) for k, x in attrs.items() if x is not None})
             if text is not None:
-                el.text = str(text)
+                el.text = _xml_text(text)
             return el
 
         hdr = sub(root, "Header")
@@ -3540,22 +4124,28 @@ class BSACertificateGenerator:
         for m in cl["mule_vpas"] + cl["onward_beneficiaries"]:
             credits = [l for l in cl["legs"] if l["payee_vpa"] == m]
             ifsc = credits[0]["payee_ifsc"] if credits else None
-            ma = sub(mules, "MuleAccount", tier="1" if m in cl["mule_vpas"] else "2")
+            flag = {} if _VPA_RE.fullmatch(m or "") else {"valid": "false",
+                                                           "invalidReason": "VPA is not in handle@provider form"}
+            ma = sub(mules, "MuleAccount", tier="1" if m in cl["mule_vpas"] else "2", **flag)
             sub(ma, "VPA", m)
             sub(ma, "IFSC", ifsc or "")
             sub(ma, "Bank", _bank_for_ifsc(ifsc))
             sub(ma, "AmountCreditedINR", f"{sum(l['amount_inr'] for l in credits):.2f}")
         rr = sub(det, "RetrievalReferenceNumbers")
         for l in cl["legs"]:
-            el = sub(rr, "RRN", l["rrn"], txn=l["txn_id"], valid=str(l["rrn_valid"]).lower(),
+            # A malformed RRN (not 12 digits, as Sector B flags it) is listed as disputed, not as an RRN.
+            twelve = re.fullmatch(r"\d{12}", str(l["rrn"])) is not None
+            valid = bool(l["rrn_valid"]) and twelve
+            el = sub(rr, "RRN" if twelve else "DisputedRRN", l["rrn"], txn=l["txn_id"], valid=str(valid).lower(),
                      timestampUTC=l["timestamp_utc"], payer=l["payer_vpa"], payee=l["payee_vpa"],
                      amountINR=f"{l['amount_inr']:.2f}")
             if l["anchor"]:
-                el.set("evidenceOffset", str(l["anchor"]["byte_offset"]))
-                el.set("evidenceLength", str(l["anchor"]["length"]))
-                el.set("evidenceSHA256", str(l["anchor"]["sha256"]))
-            if not l["rrn_valid"]:
-                el.set("invalidReason", "; ".join(l["rrn_invalid_reasons"]))
+                el.set("evidenceOffset", _xml_text(l["anchor"]["byte_offset"]))
+                el.set("evidenceLength", _xml_text(l["anchor"]["length"]))
+                el.set("evidenceSHA256", _xml_text(l["anchor"]["sha256"]))
+            if not valid:
+                el.set("invalidReason", _xml_text("; ".join(l.get("rrn_invalid_reasons") or [])
+                                                  or "RRN is not 12 digits (NPCI format)"))
         if cl["crypto_exits"]:
             cx = sub(det, "CrossChainExits")
             for x in cl["crypto_exits"]:
@@ -3613,8 +4203,11 @@ class BSACertificateGenerator:
                      "evidence_anchor": l["anchor"],
                      "action": f"Not frozen. Verify with the issuing bank / NPCI by notice under {LAW['bnss94']} "
                                f"before any restraint."} for l in cl["legs"] if not l.get("rrn_valid", True)]
+        # The cap is the verified loss: victim -> hub legs, else every hub inflow, counting only legs
+        # whose RRN passed NPCI validation. A disputed inflow never sets the amount restrained.
         loss_cap = round(sum(l["amount_inr"] for l in valid if l["payer_vpa"] in cl["victim_vpas"]
-                             and l["payee_vpa"] in cl["hub_vpas"]) or cl["total_inflow_inr"], 2)
+                             and l["payee_vpa"] in cl["hub_vpas"])
+                         or sum(l["amount_inr"] for l in valid if l["payee_vpa"] in cl["hub_vpas"]), 2)
         targets = []
         for vpa in cl["hub_vpas"] + cl["mule_vpas"] + cl["onward_beneficiaries"]:
             credits = [l for l in valid if l["payee_vpa"] == vpa]
@@ -3633,9 +4226,8 @@ class BSACertificateGenerator:
                             "evidence_anchors": [l["anchor"] for l in credits if l["anchor"]]})
         aggregate = round(sum(t["lien_amount_inr"] for t in targets), 2)
         if aggregate > loss_cap + 0.005:   # never restrain more than was taken from the victim(s)
-            scale = loss_cap / aggregate
-            for t in targets:
-                t["lien_amount_inr"] = round(t["lien_amount_inr"] * scale, 2)
+            for t, lien in zip(targets, _scale_to_cap([t["lien_amount_inr"] for t in targets], loss_cap)):
+                t["lien_amount_inr"] = lien
             aggregate = round(sum(t["lien_amount_inr"] for t in targets), 2)
         targets = [t for t in targets if t["lien_amount_inr"] > 0] + \
                   [t for t in targets if t["lien_amount_inr"] <= 0]
@@ -3664,6 +4256,9 @@ class BSACertificateGenerator:
         if disputed:
             legal_notes.append(f"{len(disputed)} transaction(s) whose RRN fails NPCI format validation are not frozen; "
                                f"they are listed separately for verification by notice under {LAW['bnss94']}.")
+        if targets and loss_cap <= 0:
+            legal_notes.append(f"No victim inflow with a validated RRN remains, so the principal loss is unverified and "
+                               f"every lien is deferred (INR 0.00) pending verification under {LAW['bnss94']}.")
         lines = [self.FREEZE_TITLE, f"Notice No. {notice_id}    Date: {ist_date_time(self.generated_utc)[0]}",
                  f"Case: {self._case('fir', v['case'] or '')}    Evidence ID: {v['evidence_id']}",
                  f"Principal loss (cap on the aggregate lien): {_fmt_inr(loss_cap)}    Aggregate lien: "
@@ -3700,12 +4295,27 @@ class BSACertificateGenerator:
                 "rrns": [l["rrn"] for l in valid if l["rrn"]],
                 "evidence_binding": {"evidence_id": v["evidence_id"], "sha256": v["sha256"],
                                      "merkle_root": v["merkle_root"], "certificate_sha256": self.certificate_digest()},
-                "demonstration": self.demo, "text": "\n".join(lines) + "\n"}
+                "demonstration": self.demonstration, "text": "\n".join(lines) + "\n"}
 
     # ----- Bundle ----------------------------------------------------------- #
 
     def export_legal_bundle(self, output_dir: str = "legal_package") -> Dict[str, str]:
+        """
+        Every file is built in a staging folder first and moved into output_dir only once the whole
+        bundle exists. A run that fails part-way, or a previous certificate PDF still held open by a
+        viewer on Windows, leaves the previous bundle exactly as it was: never a mix of old and new
+        files under an old bundle manifest.
+        """
         os.makedirs(output_dir, exist_ok=True)
+        stage = tempfile.mkdtemp(prefix=".sutra-staging-", dir=output_dir)
+        try:
+            staged = self._write_bundle(stage)
+            _swap_bundle_into(stage, output_dir, [os.path.basename(x) for x in staged.values()])
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        return {k: os.path.join(output_dir, os.path.basename(x)) for k, x in staged.items()}
+
+    def _write_bundle(self, output_dir: str) -> Dict[str, str]:
         p = lambda n: os.path.join(output_dir, n)  # noqa: E731
         paths = {"certificate_pdf": self.build_certificate_pdf(p(CERT_PDF)),
                  "annexure_pdf": self.build_annexure_pdf(p(ANNEX_PDF)),
@@ -3713,11 +4323,11 @@ class BSACertificateGenerator:
                  "qr_png": self.generate_qr_code_image(p(QR_PNG)), "certificate_json": p(CERT_JSON)}
         self.generate_fiu_ind_str_xml(output_path=paths["str_xml"])
         notice = self.generate_sec_106_bnss_freeze_notice()
-        with open(paths["freeze_notice_json"], "w", encoding="utf-8") as f:
+        with open(paths["freeze_notice_json"], "w", encoding="utf-8", newline="\n") as f:
             json.dump(notice, f, indent=2, ensure_ascii=False)
         with open(paths["freeze_notice_txt"], "w", encoding="utf-8", newline="\n") as f:
             f.write(notice["text"])
-        with open(paths["certificate_json"], "w", encoding="utf-8") as f:
+        with open(paths["certificate_json"], "w", encoding="utf-8", newline="\n") as f:
             json.dump({"certificate": self.certificate_data(), "certificate_sha256": self.certificate_digest(),
                        "qr_payload": self.generate_qr_payload()}, f, indent=2, ensure_ascii=False)
         files = {}
@@ -3732,15 +4342,56 @@ class BSACertificateGenerator:
                   "readiness": self.verify()["status"], "certificate_sha256": self.certificate_digest(),
                   "pdf_engine": self.last_render.get("certificate", {}).get("engine"),
                   "qr_engine": self.qr_matrix()[1], "fonts": self.fonts.describe(),
-                  "pdfa": self.last_render.get("certificate", {}).get("pdfa"), "demonstration": self.demo,
+                  "pdfa": self.last_render.get("certificate", {}).get("pdfa"), "demonstration": self.demonstration,
                   "files": files}
         bundle["bundle_sha256"] = _sha256_hex(canonical_json(bundle))
         key = _audit_key()
         bundle["bundle_hmac_sha256"] = hmac.new(key, canonical_json(bundle), hashlib.sha256).hexdigest() if key else None
         paths["bundle_manifest"] = p(BUNDLE_MANIFEST)
-        with open(paths["bundle_manifest"], "w", encoding="utf-8") as f:
+        with open(paths["bundle_manifest"], "w", encoding="utf-8", newline="\n") as f:
             json.dump(bundle, f, indent=2, ensure_ascii=False)
         return paths
+
+
+def _swap_bundle_into(stage: str, output_dir: str, names: Sequence[str]) -> None:
+    """
+    Move the staged files into output_dir. The previous files of the same names are first moved
+    aside into the staging folder (the bundle manifest first), then the new ones moved in (the
+    bundle manifest last). If any move fails, everything is put back as it was and a
+    LegalOutputError says which file could not be replaced.
+    """
+    order = sorted(names, key=lambda n: n != BUNDLE_MANIFEST)          # manifest out first
+    aside: List[Tuple[str, str]] = []
+    placed: List[Tuple[str, str]] = []
+
+    def undo() -> None:
+        for final, staged in reversed(placed):
+            try:
+                os.replace(final, staged)
+            except OSError:
+                pass
+        for final, old in reversed(aside):
+            try:
+                os.replace(old, final)
+            except OSError:
+                pass
+
+    current = ""
+    try:
+        for n in order:
+            current = os.path.join(output_dir, n)
+            if os.path.lexists(current):
+                old = os.path.join(stage, n + ".previous")
+                os.replace(current, old)
+                aside.append((current, old))
+        for n in reversed(order):                                       # manifest in last
+            current = os.path.join(output_dir, n)
+            os.replace(os.path.join(stage, n), current)
+            placed.append((current, os.path.join(stage, n)))
+    except OSError as e:
+        undo()
+        raise LegalOutputError(f"cannot replace {current}: {e.strerror or e}. Close any PDF viewer or other program "
+                               f"holding it open and run again; the previous bundle in {output_dir} is unchanged") from e
 
 
 _STR_REQUIRED = ("Header/ReportType", "Header/ReportingEntity", "Header/TimestampUTC", "Header/CaseReference",
@@ -3769,8 +4420,13 @@ def validate_str_xml(xml: str) -> List[str]:
     for rrn in root.findall("s:SuspiciousTransactionDetails/s:RetrievalReferenceNumbers/s:RRN", ns):
         if not re.fullmatch(r"\d{12}", rrn.text or ""):
             errs.append(f"RRN {rrn.text!r} is not 12 digits")
+    for rrn in root.findall("s:SuspiciousTransactionDetails/s:RetrievalReferenceNumbers/s:DisputedRRN", ns):
+        if rrn.get("valid") != "false" or not rrn.get("invalidReason"):
+            errs.append(f"DisputedRRN {rrn.text!r} is not marked valid=\"false\" with an invalidReason")
     for ma in root.findall("s:SuspiciousTransactionDetails/s:MuleAccounts/s:MuleAccount", ns):
-        if ma.find("s:VPA", ns) is None or not re.fullmatch(r"[\w.\-]+@[\w.\-]+", ma.find("s:VPA", ns).text or ""):
+        flagged = ma.get("valid") == "false" and bool(ma.get("invalidReason"))
+        if ma.find("s:VPA", ns) is None or not (flagged or re.fullmatch(r"[\w.\-]+@[\w.\-]+",
+                                                                         ma.find("s:VPA", ns).text or "")):
             errs.append("MuleAccount without a valid VPA")
     return errs
 
@@ -3903,7 +4559,7 @@ def _self_test(workdir: str) -> int:
         v0 = g0.verify()
         bad = os.path.join(workdir, "demo", "broken.json")
         os.makedirs(os.path.dirname(bad), exist_ok=True)
-        with open(bad, "w") as f:
+        with open(bad, "w", encoding="utf-8") as f:
             f.write("{not json")
         refused = 0
         for arg in (os.path.join(workdir, "demo", "missing.json"), bad):
@@ -4286,6 +4942,7 @@ def _self_test(workdir: str) -> int:
           f"{elapsed:.2f} s with {gb.last_render['certificate']['engine']}")
 
     regress = _audit_regression(workdir, real, make, gen, rec, tamper, custodian, expert, particulars)
+    overnight = _overnight_regression(workdir, real)
 
     print("\nCertificate status:", ver["status"])
     for b in ver["blocking"]:
@@ -4300,7 +4957,12 @@ def _self_test(workdir: str) -> int:
     r_pass = sum(1 for _, ok, _ in regress.values() if ok)
     r_skip = sum(1 for _, ok, _ in regress.values() if ok is None)
     print(f"{r_pass}/{len(regress)} audit regression checks passed" + (f", {r_skip} skipped" if r_skip else ""))
-    return 0 if passed + skipped == len(results) and r_pass + r_skip == len(regress) else 1
+    o_pass = sum(1 for _, ok, _ in overnight.values() if ok)
+    o_skip = sum(1 for _, ok, _ in overnight.values() if ok is None)
+    print(f"{o_pass}/{len(overnight)} overnight audit regression checks passed" +
+          (f", {o_skip} skipped" if o_skip else ""))
+    return 0 if (passed + skipped == len(results) and r_pass + r_skip == len(regress)
+                 and o_pass + o_skip == len(overnight)) else 1
 
 
 def _audit_regression(workdir: str, real: Optional[Dict[str, str]], make: Callable[..., "BSACertificateGenerator"],
@@ -4519,6 +5181,621 @@ def _audit_regression(workdir: str, real: Optional[Dict[str, str]], make: Callab
     return results
 
 
+def _overnight_regression(workdir: str, real: Optional[Dict[str, str]]) -> Dict[str, Tuple[str, Optional[bool], str]]:
+    """Regression checks for the overnight robustness audit of Sector D (findings D-01 to D-25, D-GRP01, D-DEMO01)."""
+    import ast
+    import builtins
+    import contextlib
+    import io
+    import tracemalloc
+    import types
+    results: Dict[str, Tuple[str, Optional[bool], str]] = {}
+    print("\nOvernight audit regression checks")
+    od = os.path.join(workdir, "overnight")
+    shutil.rmtree(od, ignore_errors=True)
+    os.makedirs(od, exist_ok=True)
+    gu = "2026-10-20T16:00:00.000Z"
+    demo = demo_case()
+
+    def attempt(code: str, name: str, fn: Callable[[], Tuple[Optional[bool], str]]) -> None:
+        try:
+            ok, detail = fn()
+        except Exception as e:  # a crash is a failed check
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        results[code] = (name, ok, detail)
+        tag = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+        print(f"  [{tag}] {code}. {name}" + (f"  ({detail[:300]})" if detail else ""))
+
+    def copies() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        return (json.loads(json.dumps(demo["a"])), json.loads(json.dumps(demo["b"])),
+                json.loads(json.dumps(demo["c"])))
+
+    def seal_a(a: Dict[str, Any]) -> Dict[str, Any]:
+        a["manifest_canonical_sha256"] = _sha256_hex(canonical_json_a(
+            {k: x for k, x in a.items() if k != "manifest_canonical_sha256"}))
+        return a
+
+    def seal_b(b: Dict[str, Any]) -> Dict[str, Any]:
+        b["manifest_sha256"] = _sha256_hex(canonical_json({k: x for k, x in b.items() if k != "manifest_sha256"}))
+        return b
+
+    def seal_c(c: Dict[str, Any]) -> Dict[str, Any]:
+        c["storyline_sha256"] = _sha256_hex(canonical_json(
+            {k: x for k, x in c.items() if k not in ("generated_utc", "storyline_sha256")}))
+        return c
+
+    def gen_demo(a: Any, b: Any = None, c: Any = None, **kw: Any) -> BSACertificateGenerator:
+        kw.setdefault("embed_fonts", False)     # base-14 fonts: no TrueType parsing per generator, faster
+        kw.setdefault("evidence_path", demo["image"])
+        kw.setdefault("seizure_video_path", demo["video"])
+        kw.setdefault("generated_utc", gu)
+        return BSACertificateGenerator(a, b, c, **kw)
+
+    def lead(b: Dict[str, Any], cat: str) -> Dict[str, Any]:
+        return next(x for x in b["symbolic_anchors"] if x.get("threat_category") == cat)
+
+    def write_case(folder: str) -> Dict[str, str]:
+        """The built-in case as files on disk, as the CLI takes it."""
+        os.makedirs(folder, exist_ok=True)
+        out = {}
+        for k, name in (("a", SECTOR_A_MANIFEST), ("b", SECTOR_B_MANIFEST), ("c", STORYLINE_FILENAME)):
+            out[k] = os.path.join(folder, name)
+            with open(out[k], "w", encoding="utf-8", newline="\n") as f:
+                json.dump(demo[k], f)
+        out["image"] = os.path.join(folder, demo["filename"])
+        out["video"] = os.path.join(folder, "seizure_recording_sec105.mp4")
+        for k in ("image", "video"):
+            with open(out[k], "wb") as f:
+                f.write(demo[k])
+        return out
+
+    @contextlib.contextmanager
+    def console(encoding: str = "utf-8") -> Iterable[Tuple[io.BytesIO, io.BytesIO]]:
+        """stdout / stderr as a console of the given encoding with strict errors (a redirected cp1252 one)."""
+        so, se = sys.stdout, sys.stderr
+        bo, be = io.BytesIO(), io.BytesIO()
+        wo = io.TextIOWrapper(bo, encoding=encoding, errors="strict", write_through=True)
+        we = io.TextIOWrapper(be, encoding=encoding, errors="strict", write_through=True)
+        sys.stdout, sys.stderr = wo, we
+        try:
+            yield bo, be
+        finally:
+            sys.stdout, sys.stderr = so, se
+            for w in (wo, we):
+                try:
+                    w.flush()
+                    w.detach()      # keep the byte buffers readable
+                except (ValueError, OSError):
+                    pass
+
+    try:
+        files = write_case(os.path.join(od, "case"))
+    except OSError as e:     # the checks that need these files then fail with a KeyError, never silently pass
+        print(f"  (could not write the built-in case to {od}: {e})")
+        files = {}
+
+    def d01() -> Tuple[bool, str]:
+        bad = os.path.join(od, "broken.json")
+        empty = os.path.join(od, "empty.json")
+        lst = os.path.join(od, "list.json")
+        for path, body in ((bad, "{bad"), (empty, ""), (lst, "[1, 2]")):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+        missing = os.path.join(od, "missing.json")
+        cases = [(["--run", "--evidence-manifest", missing], 3), (["--run", "--evidence-manifest", bad], 3),
+                 (["--run", "--evidence-manifest", empty], 3), (["--run", "--evidence-manifest", lst], 3),
+                 (["--run", "--evidence-manifest", files["a"], "--custodian", missing], 3),
+                 (["--verify-qr", "{bad", "--evidence-manifest", files["a"]], 1),
+                 (["--verify-qr", "{}", "--evidence-manifest", missing], 3)]
+        got = []
+        for argv, want in cases:
+            argv = argv + (["--out", os.path.join(od, "cli_out")] if argv[0] == "--run" else [])
+            with console() as (bo, be):
+                rc = _main(argv)
+            err = be.getvalue().decode("utf-8")
+            got.append(rc == want and "Traceback" not in err and (rc != 3 or err.startswith("ERROR: ")))
+        return all(got), f"{sum(got)}/{len(got)} bad inputs reported in one line (exit 3 / verify-qr exit 1)"
+    attempt("D-01", "CLI reports a missing, broken or non-object input in one line, never a traceback", d01)
+
+    def d02() -> Tuple[bool, str]:
+        six = {k: "x" for k in ("statute", "case", "evidence_id", "sha256", "merkle_root", "bound_root")}
+        r1 = BSACertificateGenerator.verify_qr_payload(json.dumps(dict(six, status="READY")))
+        r2 = BSACertificateGenerator.verify_qr_payload('"statute case evidence_id sha256 merkle_root bound_root"')
+        a, b, c = copies()
+        a["ingestion_timestamp_utc"] = "2026-09-01T10:00:00.000Z"      # stale self-digest: NOT FIT
+        g = gen_demo(a, b, c)
+        cert, q = g.certificate_data(), g.generate_qr_payload()
+        r3 = BSACertificateGenerator.verify_qr_payload(json.dumps(dict(q, status="READY")), None, cert)
+        r4 = BSACertificateGenerator.verify_qr_payload(json.dumps(q), None, cert)
+        return (q["status"] == "NOT_FIT" and not r1["ok"] and not r2["ok"] and not r3["ok"] and r4["ok"],
+                f"no reference: ok={r1['ok']}; string payload: ok={r2['ok']}; NOT_FIT QR edited to READY: "
+                f"ok={r3['ok']}; genuine: ok={r4['ok']}")
+    attempt("D-02", "--verify-qr never passes a payload with no reference or an edited status", d02)
+
+    def d03() -> Tuple[bool, str]:
+        six = {k: "x" for k in ("statute", "case", "evidence_id", "sha256", "merkle_root", "bound_root")}
+        old = os.environ.get("SUTRA_AUDIT_KEY")
+        os.environ["SUTRA_AUDIT_KEY"] = "overnight-test-key"
+        try:
+            res = [BSACertificateGenerator.verify_qr_payload(p, demo["a"])["ok"] for p in (
+                '"statute case evidence_id sha256 merkle_root bound_root"', json.dumps(dict(six, mac=5)),
+                json.dumps(dict(six, mac="é"), ensure_ascii=False))]
+        finally:
+            if old is None:
+                os.environ.pop("SUTRA_AUDIT_KEY", None)
+            else:
+                os.environ["SUTRA_AUDIT_KEY"] = old
+        a = json.loads(json.dumps(demo["a"]))
+        a["cryptographic_hashes"]["sha256_merkle_root_4mb"] = "not-hex"
+        res.append(BSACertificateGenerator.verify_qr_payload(json.dumps(six), a)["ok"])
+        return res == [False] * 4, f"string payload, int mac, non-ASCII mac, non-hex root -> ok={res}"
+    attempt("D-03", "Malformed QR payloads, MACs and manifest roots fail verification without an exception", d03)
+
+    def d04() -> Tuple[bool, str]:
+        d = os.path.join(od, "nohash")
+        os.makedirs(d, exist_ok=True)
+        img = os.path.join(d, "phone.img")
+        with open(img, "wb") as f:
+            f.write(_demo_bytes(100000, b"nohash"))
+        a = {"evidence_id": "EV-1", "case_reference": "FIR-1", "cryptographic_hashes": {},
+             "evidence_media": {"filename": "phone.img", "size_bytes": 100000}}
+        g = BSACertificateGenerator(a, evidence_path=img, generated_utc=gu)
+        v = g.verify()
+        pb = " ".join(g.part_b_paragraphs())
+        return (v["status"] == NOT_FIT and any("No SHA-256 hash value" in x for x in v["blocking"]) and
+                "is None" not in pb, f"no recorded SHA-256 -> {v['status']}")
+    attempt("D-04", "A Sector A manifest with no SHA-256 cannot give a signable certificate", d04)
+
+    def d05() -> Tuple[bool, str]:
+        a, _, _ = copies()
+        a.pop("manifest_canonical_sha256")
+        s1 = gen_demo(a).verify()["status"]
+        detail = f"full-layout manifest without its digest -> {s1}"
+        ok = s1 == NOT_FIT
+        if real is not None:
+            with open(real["a"], encoding="utf-8") as f:
+                ra = json.load(f)
+            ra["ingestion_timestamp_utc"] = "2026-09-01T10:00:00.000Z"
+            ra.pop("manifest_canonical_sha256", None)
+            ra["hash_algorithms"]["secondary_tree_hash"] = None
+            st = [BSACertificateGenerator(ra, real["b"], None, evidence_path=real["image"],
+                                          seizure_video_path=real["video"], evidence_root=real["root"],
+                                          strict=strict, generated_utc=gu).verify()["status"] for strict in (False, True)]
+            ok = ok and st == [NOT_FIT, NOT_FIT]
+            detail += f"; backdated, digest deleted, tree algorithm nulled -> {st[0]} (strict {st[1]})"
+        return ok, detail
+    attempt("D-05", "Deleting the Sector A digest or tree algorithm does not disable the tamper tripwires", d05)
+
+    def d06() -> Tuple[bool, str]:
+        root = os.path.dirname(files["image"])
+        a, b, c = copies()
+        b["symbolic_anchors"][0]["symbolic_anchor"]["byte_offset"] = -10
+        v1 = gen_demo(a, seal_b(b), c, evidence_path=files["image"], evidence_root=root).verify()
+        a, b, c = copies()
+        b["symbolic_anchors"][0]["symbolic_anchor"]["length"] = 4096 * 10 ** 8   # 410 GB claimed; not resealed
+        t0 = time.perf_counter()
+        v2 = gen_demo(a, b, c, evidence_path=files["image"], evidence_root=root).verify()
+        dt = time.perf_counter() - t0
+        return (v1["status"] == NOT_FIT and v2["status"] == NOT_FIT and dt < 1.0,
+                f"negative offset -> {v1['status']}; 410 GB length -> {v2['status']} in {dt:.2f} s")
+
+    attempt("D-06", "A negative anchor offset or a huge length is a MISMATCH, not a crash or a hang", d06)
+
+    def d07() -> Tuple[bool, str]:
+        root = os.path.join(od, "memroot")
+        os.makedirs(root, exist_ok=True)
+        big = os.path.join(root, "loose_artifact.bin")
+        block = _demo_bytes(1024 * 1024, b"loose")
+        h = hashlib.sha256()
+        with open(big, "wb") as f:
+            for _ in range(24):
+                f.write(block)
+                h.update(block)
+        a, b, _ = copies()
+        b["symbolic_anchors"][0]["symbolic_anchor"].update(file_path="loose_artifact.bin", byte_offset=0,
+                                                           length=24 * 1024 * 1024, sha256=h.hexdigest())
+        ver = EvidenceVerifier(a, b, None, _Source(None), _Source(None), root)
+        tracemalloc.start()
+        try:
+            res = ver._verify_anchors([], [])
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+            os.remove(big)
+        st = [e["status"] for e in res["items"] if e["file"] == "loose_artifact.bin"]
+        return (st == ["MATCH"] and peak < 16 * 1024 * 1024,
+                f"24 MB anchor {st[0] if st else '?'} with {peak / 2 ** 20:.1f} MB traced peak")
+    attempt("D-07", "Byte anchors are hashed in streamed 4 MB reads, not read whole into memory", d07)
+
+    def d08() -> Tuple[bool, str]:
+        def bsm(k: str, x: Any) -> Callable[[Dict[str, Any]], Any]:
+            return lambda a: a["bad_sector_manifest"].__setitem__(k, x)
+        a_cases = [bsm("sector_size_bytes", "abc"), bsm("sector_size_bytes", 10 ** 12), bsm("fill_pattern", "0xZZZZ"),
+                   lambda a: a["bad_sector_manifest"].update(fill_pattern="0x", bad_sectors=[3],
+                                                             bad_byte_offsets=[3 * SECTOR_SIZE]),
+                   lambda a: a["bad_sector_manifest"].update(bad_sectors=["x"]), bsm("bad_sectors", 5),
+                   lambda a: a["evidence_media"].update(size_bytes=float("nan")),
+                   lambda a: a["cryptographic_hashes"].update(sha256_linear_primary=12345),
+                   lambda a: a["evidence_media"].update(hardware_telemetry=["x"]),
+                   lambda a: a.update(admissibility="REJECTED_FOR_COURT"),
+                   lambda a: a.update(admissibility={"status": "REJECTED_FOR_COURT", "blocking_issues": [1, 2]}),
+                   lambda a: a["bnss_verification"].update(sec_106_malkhana_seal_ledger=["x"])]
+        fin = "RAPID_UPI_SMURFING"
+        b_cases = [lambda b: b["symbolic_anchors"][0].update(threat_score=float("nan")),
+                   lambda b: lead(b, fin)["lead_details"]["inflow"].update(amount_inr="2,50,000"),
+                   lambda b: b["section45_exculpatory_checklist"].update(trojan_defense_probability="n/a"),
+                   lambda b: b["section45_exculpatory_checklist"].update(supports_intrusion_hypothesis="2"),
+                   lambda b: b["section45_exculpatory_checklist"].update(checks=["C01"]),
+                   lambda b: lead(b, fin).update(lead_details=[1]),
+                   lambda b: lead(b, fin)["lead_details"].update(inflow="T1"),
+                   lambda b: b.update(symbolic_anchors=["x"]), lambda b: b.update(sector_a_binding=[1])]
+        c_cases = [lambda c: c.update(steps=[[c["steps"][0]]]), lambda c: c["steps"][0].update(provenance=[1])]
+        bad = []
+        n = 0
+        for kind, cases in (("A", a_cases), ("B", b_cases), ("C", c_cases)):
+            for i, mut in enumerate(cases):
+                for seal in (True, False):
+                    a, b, c = copies()
+                    mut({"A": a, "B": b, "C": c}[kind])
+                    if seal:
+                        for fn, doc in ((seal_a, a), (seal_b, b), (seal_c, c)):
+                            try:
+                                fn(doc)
+                            except (ValueError, TypeError):
+                                pass
+                    n += 1
+                    try:
+                        g = gen_demo(a, b, c)
+                        st = g.verify()["status"]
+                        g.certificate_data()
+                        g.generate_qr_payload()
+                        g.generate_fiu_ind_str_xml()
+                        g.generate_sec_106_bnss_freeze_notice()
+                        if st != NOT_FIT:
+                            bad.append(f"{kind}{i}{'s' if seal else 'u'}:{st}")
+                    except Exception as e:
+                        bad.append(f"{kind}{i}{'s' if seal else 'u'}:{type(e).__name__}")
+        a, b, c = copies()
+        lead(b, fin)["lead_details"]["inflow"]["amount_inr"] = "2,50,000"
+        paths = gen_demo(a, seal_b(b), c).export_legal_bundle(os.path.join(od, "malformed_bundle"))
+        with open(paths["bundle_manifest"], encoding="utf-8") as f:
+            readiness = json.load(f)["readiness"]
+        return (not bad and readiness == NOT_FIT,
+                f"{n - len(bad)}/{n} malformed A/B/C fields (sealed and unsealed) -> NOT FIT without an exception; "
+                f"full bundle exported ({readiness})" + (f"; failed: {bad}" if bad else ""))
+    attempt("D-08", "Malformed manifest fields trip NOT_FIT_FOR_FILING instead of crashing the run", d08)
+
+    def d09() -> Tuple[bool, str]:
+        a, b, c = copies()
+        t = lead(b, "INVALID_NPCI_RRN")["lead_details"]
+        t["transaction"]["rrn"] = "62871100010"
+        t["rrn_validation"] = {"rrn": "62871100010", "valid": False, "reasons": ["RRN must be exactly 12 digits"]}
+        lead(b, "RAPID_UPI_SMURFING")["lead_details"]["flagged_mules"].append("mule\x01@ybl")
+        g = gen_demo(a, seal_b(b), c)
+        xml = g.generate_fiu_ind_str_xml()
+        paths = g.export_legal_bundle(os.path.join(od, "rrn_bundle"))
+        return (not validate_str_xml(xml) and "DisputedRRN" in xml and "62871100010" in xml and "\x01" not in xml
+                and os.path.isfile(paths["bundle_manifest"]),
+                "11-digit RRN listed as DisputedRRN; control character in a VPA replaced; STR valid, bundle exported")
+    attempt("D-09", "An invalid-RRN lead or a control character in a VPA no longer aborts the STR / export", d09)
+
+    def d10() -> Tuple[bool, str]:
+        out = os.path.join(od, "atomic")
+
+        def snapshot() -> Dict[str, str]:
+            snap = {}
+            for n in sorted(os.listdir(out)):
+                full = os.path.join(out, n)
+                if os.path.isfile(full):
+                    with open(full, "rb") as f:
+                        snap[n] = _sha256_hex(f.read())
+                else:
+                    snap[n] = "<dir>"
+            return snap
+        gen_demo(demo["a"], demo["b"], demo["c"]).export_legal_bundle(out)
+        before = snapshot()
+        g = gen_demo(demo["a"], demo["b"], demo["c"], strict=True, generated_utc="2026-10-21T16:00:00.000Z")
+
+        def fail(*_a: Any, **_k: Any) -> str:
+            raise RuntimeError("simulated failure part-way through the export")
+        g.generate_fiu_ind_str_xml = fail  # type: ignore[assignment]
+        try:
+            g.export_legal_bundle(out)
+            failed = False
+        except RuntimeError:
+            failed = True
+        after_fail = snapshot()
+        real_replace = os.replace
+        cert_final = os.path.abspath(os.path.join(out, CERT_PDF))
+
+        def locked(src: Any, dst: Any) -> None:     # Windows: a PDF viewer holds the old certificate open
+            if os.path.abspath(os.fspath(src)) == cert_final or os.path.abspath(os.fspath(dst)) == cert_final:
+                raise PermissionError(13, "The process cannot access the file because it is being used by another "
+                                          "process", os.fspath(src))
+            real_replace(src, dst)
+        os.replace = locked  # type: ignore[assignment]
+        try:
+            g2 = gen_demo(demo["a"], demo["b"], demo["c"], strict=True, generated_utc="2026-10-21T16:00:00.000Z")
+            try:
+                g2.export_legal_bundle(out)
+                lock_err = ""
+            except LegalOutputError as e:
+                lock_err = str(e)
+        finally:
+            os.replace = real_replace  # type: ignore[assignment]
+        after_lock = snapshot()
+        return (failed and after_fail == before and bool(lock_err) and "unchanged" in lock_err and
+                after_lock == before and len(before) == 8,
+                f"failed re-run: previous {len(before)} files {'untouched' if after_fail == before else 'CHANGED'}; "
+                f"locked PDF: {(lock_err[:70] + '...') if lock_err else 'no error, files replaced'}; previous files "
+                f"{'untouched' if after_lock == before else 'CHANGED'}")
+    attempt("D-10", "A failed or blocked re-export leaves the previous bundle untouched (no mixed package)", d10)
+
+    def d11() -> Tuple[bool, str]:
+        refused = []
+        for kw in ({"evidence_path": os.path.join(od, "case", "image_TYPO.img")},
+                   {"seizure_video_path": os.path.join(od, "case", "seizure_TYPO.mp4")},
+                   {"evidence_root": os.path.join(od, "no_such_folder")}):
+            try:
+                BSACertificateGenerator(files["a"], files["b"], None, generated_utc=gu, **kw)
+                refused.append(False)
+            except LegalInputError:
+                refused.append(True)
+        return all(refused), f"typo'd evidence path, recording path and evidence root refused: {refused}"
+    attempt("D-11", "An explicit evidence / recording path that does not exist is an error, not 'not presented'",
+            d11)
+
+    def d12() -> Tuple[bool, str]:
+        root = os.path.join(od, "evroot")
+        os.makedirs(root, exist_ok=True)
+        outside = os.path.join(od, "outside_secret.bin")
+        data = _demo_bytes(256, b"outside")
+        with open(outside, "wb") as f:
+            f.write(data)
+        a, b, c = copies()
+        b["symbolic_anchors"][0]["symbolic_anchor"].update(file_path=os.path.abspath(outside), byte_offset=0,
+                                                           length=64, sha256=_sha256_hex(data[:64]))
+        st = [e["status"] for e in gen_demo(a, seal_b(b), c, evidence_root=root).verify()["anchors"]["items"]
+              if e["file"] == "outside_secret.bin"]
+        srcs = []
+        for name in (os.path.abspath(outside), "../outside_secret.bin"):
+            a, _, _ = copies()
+            a["evidence_media"]["filename"] = name
+            srcs.append(BSACertificateGenerator(seal_a(a), evidence_root=root, generated_utc=gu).evidence.src)
+        return (bool(st) and st[0] != "MATCH" and srcs == [None, None],
+                f"absolute anchor path -> {st[0] if st else '?'}; absolute / '..' evidence filename -> {srcs}")
+    attempt("D-12", "Manifest file names never resolve outside the evidence root", d12)
+
+    def d13() -> Tuple[bool, str]:
+        out = os.path.join(od, "केस_042")
+        with console("cp1252") as (bo, be):
+            try:
+                rc: Any = _main(["--run", "--evidence-manifest", files["a"], "--triage-manifest", files["b"],
+                                 "--storyline", files["c"], "--evidence-path", files["image"], "--video",
+                                 files["video"], "--out", out])
+            except UnicodeEncodeError as e:
+                rc = f"UnicodeEncodeError: {e}"
+        text = bo.getvalue().decode("cp1252", "replace")
+        return (rc in (0, 2) and "Certificate status" in text,
+                f"--run into a Devanagari folder with a cp1252 console: exit {rc}")
+    attempt("D-13", "Console output survives a cp1252 (redirected Windows) stdout", d13)
+
+    def d14() -> Tuple[bool, str]:
+        para = ("I examined indicator C04 against the RDP event logs, the remote-access trace and the firewall "
+                "export; the inbound connection was attributable to the vendor's maintenance window. ")
+        text = (para * 60)[:6000].strip()
+        g = gen_demo(demo["a"], demo["b"], demo["c"], expert=dict(_DEMO_EXPERT, examiner_reconciliation=text),
+                     embed_fonts=True)
+        g.build_certificate_pdf(os.path.join(od, "long_reconciliation.pdf"))
+        rec = g.last_render["recorder"]
+        qr_op = next(o for o in rec.pages[0] if o[0] == "qr")
+        qr_cert = json.loads(qr_decode(qr_op[4]))["cert"]
+        g.build_annexure_pdf(os.path.join(od, "long_reconciliation_annex.pdf"))
+        hindi = ("प्राथमिकी क्रमांक "
+                 "042/2026, साइबर अपराध पुलिस "
+                 "थाना, गांधीनगर, गुजरात")
+        a, _, _ = copies()
+        a["case_reference"] = hindi + " - " + hindi
+        g2 = gen_demo(seal_a(a), embed_fonts=True)
+        g2.build_certificate_pdf(os.path.join(od, "devanagari_case.pdf"))
+        return ("continues, in full, in Annexure X" in rec.page_text(2).replace("\n", " ") and
+                qr_cert == g.certificate_digest() and text in g.certificate_data()["part_b"]["section45"]
+                ["examiner_reconciliation"],
+                f"6000-character reconciliation continued in Annexure X (QR digest matches the printed data); "
+                f"{len(a['case_reference'])}-character Devanagari case reference fits the QR")
+    attempt("D-14", "Long reconciliations and long non-Latin case references still produce the certificate", d14)
+
+    def d15() -> Tuple[bool, str]:
+        g = BSACertificateGenerator(scenario=ScenarioType.VICTIM_COOPERATIVE, generated_utc=gu,
+                                    custodian={"name": "राहुल मेहता"})
+        v = g.verify()
+        hit = [n for n in v["notes"] if "cannot print" in n and "custodian.name" in n]
+        return bool(hit), (hit[0][:110] if hit else "no note about unprintable characters")
+    attempt("D-15", "Characters the certificate font cannot print are reported, not silently printed as '?'", d15)
+
+    def d16() -> Tuple[bool, str]:
+        a, b, c = copies()
+        for chk in b["section45_exculpatory_checklist"]["checks"][:6]:
+            chk["result"] = "SUPPORTS_INTRUSION_HYPOTHESIS"
+        g = gen_demo(a, seal_b(b), c)
+        s45 = g.section45_summary()
+        v = g.verify()
+        return (s45["supports_intrusion_hypothesis"] == 7 and v["status"] == NOT_FIT and
+                any("summary disagrees" in x for x in v["blocking"]),
+                f"7 intrusion results listed, summary says 2: PART B counts {s45['supports_intrusion_hypothesis']}; "
+                f"{v['status']}")
+    attempt("D-16", "Section 45 counts come from the per-check results; a disagreeing summary blocks", d16)
+
+    def d17() -> Tuple[bool, str]:
+        a, b, c = copies()
+        t1 = lead(b, "RAPID_UPI_SMURFING")["lead_details"]["inflow"]
+        b["symbolic_anchors"].append({"lead_id": "LEAD-B-FIN-005", "threat_category": "INVALID_NPCI_RRN",
+                                      "lead_details": {"transaction": t1, "rrn_validation": {
+                                          "rrn": t1["rrn"], "valid": False, "reasons": ["spoofed"]}}})
+        n = gen_demo(a, seal_b(b), c).generate_sec_106_bnss_freeze_notice()
+        return (n["principal_loss_cap_inr"] == 0 and n["aggregate_lien_inr"] == 0 and
+                any("unverified" in x for x in n["legal_notes"]),
+                f"victim inflow with a disputed RRN: cap {_fmt_inr(n['principal_loss_cap_inr'])}, liens "
+                f"{_fmt_inr(n['aggregate_lien_inr'])}")
+    attempt("D-17", "A disputed (invalid-RRN) inflow never sets the freeze-notice loss cap", d17)
+
+    def d18() -> Tuple[bool, str]:
+        liens = [36934.36, 73914.96, 79436.69, 89793.24, 7406.5, 15429.67, 6537.15, 78275.62, 96057.7]
+        cap = 290449.56
+
+        def leg(t: str, payer: str, payee: str, amt: float, rrn: str) -> Dict[str, Any]:
+            return {"txn_id": t, "timestamp_utc": "", "payer_vpa": payer, "payee_vpa": payee,
+                    "payee_ifsc": "YESB0000001", "amount_inr": amt, "rrn": rrn, "rrn_valid": True,
+                    "rrn_invalid_reasons": [], "anchor": None}
+        legs = [leg("V", "victim@x", "hub@x", cap, "100000000000"), leg("H", "hub@x", "sink@x", cap, "100000000099")]
+        legs += [leg(f"M{i}", "src@x", f"m{i}@x", x, f"1000000000{i:02d}") for i, x in enumerate(liens)]
+        cl = {"hub_vpas": ["hub@x"], "hub_vpa": "hub@x", "victim_vpas": ["victim@x"],
+              "mule_vpas": [f"m{i}@x" for i in range(len(liens))], "onward_beneficiaries": [], "legs": legs,
+              "crypto_exits": [], "invalid_rrns": {}, "total_inflow_inr": cap, "rrns": []}
+        n = BSACertificateGenerator(generated_utc=gu).generate_sec_106_bnss_freeze_notice(cl)
+        total = round(sum(t["lien_amount_inr"] for t in n["targets"]), 2)
+        import random
+        rnd, over = random.Random(2026), 0
+        for _ in range(2000):
+            amounts = [round(rnd.uniform(1000, 100000), 2) for _ in range(rnd.randint(2, 9))]
+            limit = round(rnd.uniform(0.2, 0.95) * sum(amounts), 2)
+            over += sum(round(x * 100) for x in _scale_to_cap(amounts, limit)) > round(limit * 100)
+        return (total <= cap and n["aggregate_lien_inr"] <= cap and over == 0,
+                f"scaled liens total {_fmt_inr(total)} <= cap {_fmt_inr(cap)}; 2000 random cases, {over} over the cap")
+    attempt("D-18", "Scaled liens never exceed the principal-loss cap after rounding", d18)
+
+    def d19() -> Tuple[bool, str]:
+        got = (_fmt_inr(-1234.5), _fmt_inr(-0.5), _fmt_inr(1234567.891), _fmt_inr(float("nan")))
+        return got == ("INR -1,234.50", "INR -0.50", "INR 12,34,567.89", "INR ?"), ", ".join(got)
+    attempt("D-19", "Negative amounts are formatted correctly (no floor-division skew)", d19)
+
+    def d20() -> Tuple[bool, str]:
+        base = datetime.datetime
+
+        class _Py310(base):   # type: ignore[misc,valid-type]  # Python 3.10 takes only 3 or 6 fraction digits
+            @classmethod
+            def fromisoformat(cls, s: str) -> datetime.datetime:  # type: ignore[override]
+                m = re.search(r"\.(\d+)", s)
+                if m and len(m.group(1)) not in (3, 6):
+                    raise ValueError(f"Invalid isoformat string: {s!r}")
+                return base.fromisoformat(s)
+        g = globals()
+        real_dt = g["datetime"]
+        g["datetime"] = types.SimpleNamespace(datetime=_Py310, timezone=real_dt.timezone,
+                                              timedelta=real_dt.timedelta)
+        try:
+            got = [ist_date_time(f"2026-10-15T05:10:00{f}Z") for f in (".5", ".12", ".1234", ".12345", ".000",
+                                                                        ".123456789")]
+        finally:
+            g["datetime"] = real_dt
+        return (all(x == ("15/10/2026", "10:40:00 IST") for x in got),
+                f"1, 2, 4, 5, 3 and 9 fractional digits under Python 3.10 rules: "
+                f"{sum(x[0] != '__/__/____' for x in got)}/{len(got)} parsed")
+    attempt("D-20", "Timestamps with 1-9 fractional digits parse on Python 3.10", d20)
+
+    def d21() -> Tuple[bool, str]:
+        real_open = builtins.open
+
+        def windows_open(file: Any, mode: str = "r", *args: Any, **kw: Any) -> Any:
+            # Windows text mode turns "\n" into "\r\n" unless newline= is given.
+            if "b" not in mode and any(m in mode for m in "wax") and len(args) < 4 and kw.get("newline") is None:
+                kw["newline"] = "\r\n"
+            return real_open(file, mode, *args, **kw)
+        globals()["open"] = windows_open
+        try:
+            paths = gen_demo(demo["a"], demo["b"], demo["c"]).export_legal_bundle(os.path.join(od, "crlf"))
+        finally:
+            del globals()["open"]
+        crlf = []
+        for p in paths.values():
+            if p.endswith((".json", ".xml", ".txt")):
+                with open(p, "rb") as f:
+                    if b"\r\n" in f.read():
+                        crlf.append(os.path.basename(p))
+        return not crlf, "JSON / XML / TXT outputs keep LF line ends under Windows text mode" if not crlf else \
+            f"CRLF in {crlf}"
+    attempt("D-21", "Bundle files are byte-identical across Windows and Linux (no CRLF translation)", d21)
+
+    def d22() -> Tuple[bool, str]:
+        here = os.getcwd()
+        d = os.path.join(od, "helpdir")
+        os.makedirs(d, exist_ok=True)
+        os.chdir(d)
+        try:
+            with console():
+                rcs = [_main(["--help"]), _main(["--hlep"])]
+        finally:
+            os.chdir(here)
+        made = os.listdir(d)
+        return rcs == [0, 2] and not made, f"--help exit {rcs[0]}, unknown flag exit {rcs[1]}; folders made: {made}"
+    attempt("D-22", "--help or a mistyped flag prints the usage instead of running the self-test", d22)
+
+    def d23() -> Tuple[bool, str]:
+        t = " ".join(BSACertificateGenerator(generated_utc=gu).part_a_declarations())
+        i = t.find("in a search conducted under")
+        return ("search conducted under " + LAW["bnss105"] not in t and f"As {LAW['bnss105']} requires" in t,
+                t[i:i + 150] if i >= 0 else "no search clause")
+    attempt("D-23", "PART A no longer says the search was conducted under Section 105 BNSS", d23)
+
+    def d24() -> Tuple[Optional[bool], str]:
+        fs = FontSet()
+        if not fs.embedded:
+            return None, "no embeddable TrueType font on this machine"
+        win = os.path.join(od, "WinDir")
+        os.makedirs(os.path.join(win, "Fonts"), exist_ok=True)
+        for k, n in (("R", "arial.ttf"), ("B", "arialbd.ttf"), ("M", "consola.ttf")):
+            shutil.copyfile(fs.ttf[k].path, os.path.join(win, "Fonts", n))
+        old = {k: os.environ.get(k) for k in ("WINDIR", "SUTRA_PDF_FONTS")}
+        os.environ["WINDIR"] = win
+        os.environ.pop("SUTRA_PDF_FONTS", None)      # an explicit font list would be tried first
+        try:
+            found = FontSet().ttf.get("R")
+        finally:
+            for k, x in old.items():
+                if x is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = x
+        path = found.path if found else ""
+        return (os.path.abspath(path).startswith(os.path.abspath(win)),
+                f"fonts found under %WINDIR% = {os.path.basename(win)}: {os.path.basename(path) or 'none'}")
+    attempt("D-24", "Windows fonts are found through %WINDIR%, on any drive", d24)
+
+    def d25() -> Tuple[bool, str]:
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        bad = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":
+                mode = node.args[1] if len(node.args) > 1 else next((k.value for k in node.keywords
+                                                                      if k.arg == "mode"), None)
+                text = not (isinstance(mode, ast.Constant) and "b" in str(mode.value))
+                if text and not any(k.arg == "encoding" for k in node.keywords):
+                    bad.append(node.lineno)
+        return not bad, ("every text-mode open() names its encoding" if not bad else f"lines {bad}")
+    attempt("D-25", "No text-mode open() relies on the locale encoding (EncodingWarning)", d25)
+
+    def grp01() -> Tuple[bool, str]:
+        g = BSACertificateGenerator(generated_utc=gu)
+        g.build_certificate_pdf(os.path.join(od, "groups.pdf"))
+        t = g.last_render["recorder"].page_text(2).replace("\n", " ")
+        return ("C01-C14 group" not in t and "C01-C06, C13, C14 group" in t and _id_runs(
+            ["C07", "C08", "C09", "C10", "C11", "C12"]) == "C07-C12", t[t.find("By group"):][:90])
+    attempt("D-GRP01", "PART B names a non-contiguous Section 45 group by its real members", grp01)
+
+    def demo01() -> Tuple[bool, str]:
+        g = gen_demo(demo["a"], demo["b"], demo["c"], scenario=ScenarioType.SUSPECT_HOSTILE,
+                     custodian=dict(_DEMO_PARTIES[ScenarioType.SUSPECT_HOSTILE.value]), expert=dict(_DEMO_EXPERT),
+                     case_particulars=dict(_DEMO_CASE))
+        n = g.generate_sec_106_bnss_freeze_notice()
+        return (not g.demo and g.certificate_data()["demonstration"] is True and n["demonstration"] is True and
+                n["issued_by"]["name"].endswith("(demonstration)") and n["text"].count("(demonstration)") >= 1,
+                f"demo personas on supplied manifests: demonstration={g.certificate_data()['demonstration']}, "
+                f"notice signed '{n['issued_by']['name']}'")
+    attempt("D-DEMO01", "Demonstration personas mark every bundle document as a demonstration", demo01)
+    return results
+
+
 def _walk_kv(obj: Any, key: str) -> Iterable[Tuple[str, Any]]:
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -4531,6 +5808,7 @@ def _walk_kv(obj: Any, key: str) -> Iterable[Tuple[str, Any]]:
 
 
 def _main(argv: Sequence[str]) -> int:
+    _console_safe()
     if argv and argv[0] == "--run":
         import argparse
         ap = argparse.ArgumentParser(prog="sector_d_legal.py --run")
@@ -4551,17 +5829,22 @@ def _main(argv: Sequence[str]) -> int:
         ap.add_argument("--expert", help="JSON file: name, qualification, designation, laboratory, accreditation, "
                                          "notification_79a, notified_79a, place")
         ap.add_argument("--case", help="JSON file: court, fir, offences, seizure_memo, seizure_place, seizure_utc, "
-                                       "source_type, notice_94, notice_94_utc, entity, period, io, lab")
+                                       "search_provision, source_type, notice_94, notice_94_utc, entity, period, io, "
+                                       "lab")
         ap.add_argument("--pdf-engine", default="auto", choices=["auto", "reportlab", "pure"])
         ap.add_argument("--out", default="legal_package")
         a = ap.parse_args(argv[1:])
-        g = BSACertificateGenerator(a.evidence_manifest, a.triage_manifest, a.storyline, a.scenario, a.track,
-                                    evidence_path=a.evidence_path, seizure_video_path=a.video,
-                                    evidence_root=a.evidence_root, custodian=_load_json_input(a.custodian, "custodian"),
-                                    expert=_load_json_input(a.expert, "expert"),
-                                    case_particulars=_load_json_input(a.case, "case particulars"),
-                                    pdf_engine=a.pdf_engine, strict=a.strict)
-        paths = g.export_legal_bundle(a.out)
+        try:
+            g = BSACertificateGenerator(a.evidence_manifest, a.triage_manifest, a.storyline, a.scenario, a.track,
+                                        evidence_path=a.evidence_path, seizure_video_path=a.video,
+                                        evidence_root=a.evidence_root,
+                                        custodian=_load_json_input(a.custodian, "custodian"),
+                                        expert=_load_json_input(a.expert, "expert"),
+                                        case_particulars=_load_json_input(a.case, "case particulars"),
+                                        pdf_engine=a.pdf_engine, strict=a.strict)
+            paths = g.export_legal_bundle(a.out)
+        except _CLI_ERRORS as e:
+            return _cli_error(e)
         ver = g.verify()
         print(f"Certificate status: {ver['status']}")
         for b in ver["blocking"]:
@@ -4579,12 +5862,45 @@ def _main(argv: Sequence[str]) -> int:
         ap.add_argument("--certificate-json")
         a = ap.parse_args(argv[1:])
         cert = None
-        if a.certificate_json:
-            cert = (_load_json_input(a.certificate_json, "certificate JSON") or {}).get("certificate")
-        res = BSACertificateGenerator.verify_qr_payload(a.payload, a.evidence_manifest, cert)
+        try:
+            if a.certificate_json:
+                cert = (_load_json_input(a.certificate_json, "certificate JSON") or {}).get("certificate")
+                if cert is None:
+                    raise LegalInputError(f"certificate JSON: {a.certificate_json} has no 'certificate' object")
+            res = BSACertificateGenerator.verify_qr_payload(a.payload, a.evidence_manifest, cert)
+        except _CLI_ERRORS as e:
+            return _cli_error(e)
         print(json.dumps(res, indent=2))
         return 0 if res["ok"] else 1
-    return _self_test(argv[0] if argv else os.path.join(os.getcwd(), "sutra_legal_selftest"))
+    if argv and argv[0] in ("-h", "--help"):
+        print(_usage())
+        return 0
+    if argv and argv[0].startswith("-"):
+        # A mistyped flag is not a work folder: never run the self-test into a folder named "--xyz".
+        print(f"sector_d_legal.py: unknown option {argv[0]}\n\n{_usage()}", file=sys.stderr)
+        return 2
+    try:
+        return _self_test(argv[0] if argv else os.path.join(os.getcwd(), "sutra_legal_selftest"))
+    except (LegalOutputError, PermissionError) as e:   # e.g. a self-test PDF still open in a viewer on Windows
+        print(f"ERROR: the self-test could not write its outputs: {e}. Close any viewer holding a file in the "
+              f"self-test folder and run again.", file=sys.stderr)
+        return 3
+
+
+# Errors the CLI reports in one line (exit 3) instead of a traceback: bad or missing inputs, a file
+# that cannot be read or written, and outputs that cannot be produced (e.g. a page that cannot fit).
+_CLI_ERRORS = (LegalInputError, LegalOutputError, OSError, ValueError, RuntimeError)
+
+
+def _cli_error(e: BaseException) -> int:
+    print(f"ERROR: {e}", file=sys.stderr)
+    return 3
+
+
+def _usage() -> str:
+    doc = __doc__ or ""
+    return (doc[doc.find("Usage"):].strip() if "Usage" in doc else
+            "python sector_d_legal.py [workdir | --run ... | --verify-qr ...]")
 
 
 if __name__ == "__main__":

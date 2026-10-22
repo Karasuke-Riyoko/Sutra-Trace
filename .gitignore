@@ -43,3 +43,8 @@ real_case/
 # Scratch directories
 prototype/try/
 scratch/
+
+# Cockpit run folders and scratch
+sutra_cockpit_*/
+.tmp/
+*.bak*

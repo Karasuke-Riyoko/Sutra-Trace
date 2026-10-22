@@ -313,7 +313,8 @@ class AnchorInspector:
     """
     Re-reads every byte anchor (file, Omega, length) from the evidence, re-hashes it, and, when the
     file is the image Sector A vaulted, proves each 1 KB sub-block it touches against the Sector A
-    RFC 6962 Merkle root with Sector A's own prove_sub_block().
+    RFC 6962 Merkle root the way Sector A's own prove_sub_block() does (with Sector A's Merkle helpers and
+    verifier, reading each 4 MB chunk once per anchor).
 
     Two modes:
       inspect(prov)       run snapshot, taken once when the pipeline finishes; memoised, and served in
@@ -363,6 +364,69 @@ class AnchorInspector:
             self._proofs[key] = p
         return p
 
+    def _proofs_for(self, fname: str, idxs: Sequence[int], cache: bool = True) -> List[Dict[str, Any]]:
+        """
+        prove_sub_block() for many sub-blocks at once: each 4 MB chunk is read through Sector A's write
+        blocker and hashed once, then every needed audit path is taken from that one tree (overnight audit
+        E-02: one chunk read per sub-block made a 1 MiB anchor cost ~1024 chunk reads). The proofs are the
+        ones Sector A's prove_sub_block() builds, from Sector A's own Merkle helpers and verifier; when any
+        helper is missing this falls back to prove_sub_block() per sub-block.
+        """
+        out: Dict[int, Dict[str, Any]] = {}
+        todo = []
+        for i in idxs:
+            if cache and (fname, i) in self._proofs:
+                out[i] = self._proofs[(fname, i)]
+            else:
+                todo.append(i)
+        vault, manifest, path = self.vaults[fname]
+        sa = _sector_a
+        helpers = [getattr(sa, n, None) for n in ("_merkle_levels", "_proof_from_levels", "verify_merkle_proof",
+                                                  "_get_fd_size")]
+        batch = (len(todo) > 1 and all(helpers) and all(hasattr(vault, n) for n in (
+            "_read_chunk", "_sub_block_leaves", "write_blocker", "CHUNK_SIZE", "SUB_CHUNK_SIZE")))
+        if not batch:
+            for i in todo:
+                out[i] = self._proof(fname, i, cache=cache)
+            return [out[i] for i in idxs]
+        levels_of, proof_from, verify, fd_size = helpers
+        per_chunk = vault.CHUNK_SIZE // vault.SUB_CHUNK_SIZE
+        by_chunk: Dict[int, List[int]] = {}
+        for i in todo:
+            by_chunk.setdefault(i // per_chunk, []).append(i)
+        for ci, members in by_chunk.items():
+            try:
+                bad = set(manifest["bad_sector_manifest"]["bad_sectors"])
+                fd = vault.write_blocker.open_read_only(path)
+                try:
+                    data, _, _ = vault._read_chunk(fd, ci, bad, fd_size(fd))
+                finally:
+                    os.close(fd)
+                leaves = vault._sub_block_leaves(data)
+                root = manifest["cryptographic_hashes"]["sha256_merkle_root_4mb"]
+                top = proof_from(levels_of([bytes.fromhex(h) for h in manifest["merkle_tree"]["chunk_roots"]]), ci)
+                local_levels = levels_of(leaves)
+            except Exception as e:  # a chunk that cannot be read or hashed fails every proof in it
+                for i in members:
+                    out[i] = {"sub_block_index": i, "verified": False, "error": f"{type(e).__name__}: {e}"}
+                continue
+            for i in members:
+                local = i - ci * per_chunk
+                if local >= len(leaves):
+                    p: Dict[str, Any] = {"sub_block_index": i, "verified": False,
+                                         "error": "IndexError: sub-block index beyond end of evidence"}
+                else:
+                    proof = proof_from(local_levels, local) + top
+                    leaf_hash = leaves[local].hex()
+                    p = {"sub_block_index": i, "byte_offset": i * vault.SUB_CHUNK_SIZE, "chunk_index": ci,
+                         "leaf_hash": leaf_hash, "proof": proof, "root": root,
+                         "verified": verify(leaf_hash, proof, root)}
+                out[i] = p
+        if cache:
+            for i in todo:
+                self._proofs[(fname, i)] = out[i]
+        return [out[i] for i in idxs]
+
     def inspect(self, prov: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Run snapshot (memoised). Registers the anchor so it can be re-verified live later."""
         parsed, none = self._parse(prov)
@@ -385,7 +449,16 @@ class AnchorInspector:
         parsed, _ = self._parse(prov)
         fname, off, ln, rec = parsed  # type: ignore[misc]
         with self._live_lock:
-            return self._evaluate(prov, fname, off, ln, rec, live=True)
+            # Sector A's write blocker logs every read-only open; a live re-check must not grow that log
+            # for as long as the cockpit runs (overnight audit E-03), so it is put back as it was.
+            vault = self.vaults.get(fname, (None,))[0]
+            log = getattr(getattr(vault, "write_blocker", None), "log", None)
+            n = len(log) if isinstance(log, list) else None
+            try:
+                return self._evaluate(prov, fname, off, ln, rec, live=True)
+            finally:
+                if n is not None:
+                    del log[n:]  # type: ignore[index]
 
     def _evaluate(self, prov: Dict[str, Any], fname: str, off: int, ln: int, rec: Any, live: bool) -> Dict[str, Any]:
         path = self.roots.get(fname)
@@ -408,6 +481,17 @@ class AnchorInspector:
         }
         if fname in self.vaults and now is not None:
             out["merkle"] = self._merkle(fname, off, ln, cache=not live)
+        elif fname in self.vaults:   # the vaulted image itself is missing, unreadable or shorter than the anchor
+            manifest = self.vaults[fname][1]
+            first, last = off // A_SUB_BLOCK, (off + max(ln, 1) - 1) // A_SUB_BLOCK
+            out["merkle"] = {"status": "NOT_EVALUATED",
+                             "note": "The image Sector A vaulted for this exhibit could not be read over this "
+                                     "anchor (missing, unreadable or shorter than the anchor), so no inclusion "
+                                     "proof was attempted.",
+                             "root": (manifest.get("cryptographic_hashes") or {}).get("sha256_merkle_root_4mb"),
+                             "evidence_id": manifest.get("evidence_id"), "sub_blocks": [first, last],
+                             "needed": last - first + 1, "checked": 0, "proved": 0, "sampled": False,
+                             "chunks_spanned": [], "failed_sub_blocks": []}
         else:
             out["merkle"] = {"status": "NOT_IN_VAULTED_IMAGE",
                              "note": "This source file is not the image Sector A vaulted for this exhibit; the "
@@ -436,7 +520,7 @@ class AnchorInspector:
                 pick.add(max(first, c * per))
                 pick.add(min(last, (c + 1) * per - 1))
             idxs = sorted(pick)
-        proofs = [(i, self._proof(fname, i, cache=cache)) for i in idxs]
+        proofs = list(zip(idxs, self._proofs_for(fname, idxs, cache=cache)))
         proved = sum(1 for _, p in proofs if p.get("verified"))
         all_ok = proved == len(proofs)
         groups: Dict[Any, List[Tuple[int, Dict[str, Any]]]] = {}
@@ -731,20 +815,30 @@ def vault_view(run: Dict[str, Any]) -> Dict[str, Any]:
     enf = dict(vid.get("indian_enf_power_hum_50hz") or {})
     seal = bnss["sec_106_malkhana_seal_ledger"]
     sigs = seal.get("signatures") or {}
+
+    def sig_status(m: str) -> Optional[str]:
+        sig = sigs.get(m)
+        return (str(sig.get("status") or "UNVERIFIED") if isinstance(sig, dict) else "ATTACHED") if sig else None
+
+    def signed(m: str) -> bool:   # only a signature Sector A verified counts as signed (overnight audit E-SIG01)
+        return sig_status(m) == "VALID"
+
     chain = [
         {"point": 1, "title": "Crime-scene Faraday bag seal", "statute": "Section 106 BNSS",
          "detail": f"barcode digest {seal.get('field_seal_barcode_sha256', '')[:16]}…; "
                    f"RSSI {seal.get('field_seal_rssi_dbm')} dBm (threshold ≤ -110 dBm); "
                    f"RF isolated: {seal.get('field_seal_rf_isolated')}",
          "rssi_dbm": seal.get("field_seal_rssi_dbm"), "ok": bool(seal.get("field_seal_rf_isolated")),
-         "hash": seal.get("h_seal_field"), "signed": bool(sigs.get("field"))},
+         "hash": seal.get("h_seal_field"), "signed": signed("field"), "signature_status": sig_status("field")},
         {"point": 2, "title": "Malkhana register deposit", "statute": "Section 106 BNSS",
          "detail": f"receipt {seal.get('malkhana_register_receipt')} deposited {seal.get('malkhana_deposit_utc')}",
          "receipt": seal.get("malkhana_register_receipt"), "ok": bool(seal.get("malkhana_register_receipt")),
-         "hash": seal.get("h_malkhana"), "signed": bool(sigs.get("malkhana"))},
+         "hash": seal.get("h_malkhana"), "signed": signed("malkhana"),
+         "signature_status": sig_status("malkhana")},
         {"point": 3, "title": "Laboratory unsealing camera verification", "statute": "Section 106 BNSS",
          "detail": f"seal barcode re-read at unsealing matches the field seal: {seal.get('lab_unseal_verified')}",
-         "ok": bool(seal.get("lab_unseal_verified")), "hash": seal.get("h_lab"), "signed": bool(sigs.get("lab"))},
+         "ok": bool(seal.get("lab_unseal_verified")), "hash": seal.get("h_lab"), "signed": signed("lab"),
+         "signature_status": sig_status("lab")},
     ]
     size = a["evidence_media"]["size_bytes"]
     p = run["pc"]["a"]
@@ -769,7 +863,8 @@ def vault_view(run: Dict[str, Any]) -> Dict[str, Any]:
                     and isinstance(enf.get("threshold_rad"), (int, float))
                     and enf["max_phase_jump_rad"] < enf["threshold_rad"]),
         "seal_chain": chain, "seal_chain_head": seal.get("h_sec106_seal_chain"),
-        "seal_signatures": "attached" if sigs else "none attached (officer signatures pending)",
+        "seal_signatures": (", ".join(f"{m} {sig_status(m) or 'none'}" for m in ("field", "malkhana", "lab"))
+                            if sigs else "none attached (officer signatures pending)"),
         "rfc3161": (a.get("rfc3161_time_anchor") or {}).get("status"),
         "navic": (a.get("navic_stratum1_sync") or {}).get("clock_discipline_status"),
         "admissibility": a["admissibility"],
@@ -907,12 +1002,16 @@ def triage_view(run: Dict[str, Any]) -> Dict[str, Any]:
                "normalized": l["lead_details"].get("normalized"), "context": l["lead_details"].get("context"),
                "anchor": insp.inspect(l.get("symbolic_anchor"))} for l in _leads(b, "MIRROR_HAWALA_TOKEN")]
     bridge = []
+    # The window Sector B matched bridges in: -CLOCK_SKEW_S <= dt <= TAU_ESCROW_S (overnight audit E-06).
+    det = getattr(_sector_b, "FinancialMuleDetector", None)
+    esc_lo, esc_hi = -float(getattr(det, "CLOCK_SKEW_S", 30.0)), float(getattr(det, "TAU_ESCROW_S", 300.0))
     for l in _leads(b, "CROSS_CHAIN_BRIDGE"):
         d = l["lead_details"]
         bridge.append({"lead_id": l["lead_id"], "threat_score": l["threat_score"], "upi": d.get("upi"),
-                       "chain": d.get("chain"), "delta_t_s": d.get("delta_t_s"), "escrow_window_s": 300,
+                       "chain": d.get("chain"), "delta_t_s": d.get("delta_t_s"), "escrow_window_s": esc_hi,
+                       "escrow_window_bounds_s": [esc_lo, esc_hi],
                        "within_escrow_window": isinstance(d.get("delta_t_s"), (int, float))
-                       and 0 <= d["delta_t_s"] <= 300,
+                       and esc_lo <= d["delta_t_s"] <= esc_hi,
                        "implied_inr_per_usdt": d.get("implied_inr_per_usdt"), "p2p_premium": d.get("p2p_premium"),
                        "rate_window_ok": d.get("rate_window_ok"), "affinity": d.get("affinity"),
                        "upi_anchor": insp.inspect(l.get("symbolic_anchor")),
@@ -2217,8 +2316,15 @@ class CockpitApp:
 
     def __init__(self, workdir: Optional[str] = None, keep: bool = False):
         self.owns_dir = workdir is None
-        self.base = os.path.abspath(workdir) if workdir else tempfile.mkdtemp(prefix="sutra_cockpit_")
-        os.makedirs(self.base, exist_ok=True)
+        if workdir:
+            # Run numbers restart at 1 in every process, so each process writes into its own new session
+            # folder under --workdir: a persistent or shared workdir never has another session's or another
+            # instance's run folder overwritten, pruned or counted (overnight audit E-04).
+            root = os.path.abspath(workdir)
+            os.makedirs(root, exist_ok=True)
+            self.base = tempfile.mkdtemp(prefix="session_", dir=root)
+        else:
+            self.base = tempfile.mkdtemp(prefix="sutra_cockpit_")
         self.keep = keep
         self._run_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -2283,9 +2389,35 @@ class CockpitApp:
             if port == 80:
                 self.allowed_hosts |= {"127.0.0.1", "localhost", "[::1]"}
         elif host in ("0.0.0.0", "::", ""):
-            # Wildcard bind: any interface address may be used, so the Host header cannot be pinned.
-            # _post_run() still requires Origin, when sent, to match Host.
-            self.allowed_hosts = None
+            # Wildcard bind: pin Host to this machine's own names and addresses, so a DNS-rebound name
+            # (attacker.example resolved to this laptop) is refused with 421 (overnight audit E-11).
+            names = {"127.0.0.1", "localhost", "[::1]"}
+            try:
+                hn = socket.gethostname()
+            except OSError:
+                hn = ""
+            cands = [hn]
+            if hn:
+                try:
+                    cands.append(socket.getfqdn(hn))
+                except OSError:
+                    pass
+                try:
+                    cands += [ai[4][0] for ai in socket.getaddrinfo(hn, None)]
+                except OSError:
+                    pass
+            for fam, probe in ((socket.AF_INET, ("192.0.2.1", 9)), (socket.AF_INET6, ("2001:db8::1", 9))):
+                try:   # the address the default route would use; a UDP connect sends no packet
+                    with socket.socket(fam, socket.SOCK_DGRAM) as so:
+                        so.connect(probe)
+                        cands.append(so.getsockname()[0])
+                except OSError:
+                    pass
+            for c in cands:
+                c = str(c or "").split("%", 1)[0].lower()
+                if c:
+                    names.add(f"[{c}]" if ":" in c else c)
+            self.allowed_hosts = {f"{n}:{port}" for n in names} | (names if port == 80 else set())
         else:
             # A specific LAN address: pin Host to exactly that address and port.
             h = host.lower()
@@ -2297,9 +2429,12 @@ class CockpitApp:
 
     def dispatch(self, method: str, target: str, headers: Dict[str, str]) -> Response:
         hdr = {k.lower(): v for k, v in headers.items()}
-        parts = urlsplit(target)
-        path = parts.path or "/"
-        query = parse_qs(parts.query)
+        try:
+            parts = urlsplit(target)
+            path = parts.path or "/"
+            query = parse_qs(parts.query)
+        except ValueError:   # e.g. "GET http://[x/ HTTP/1.1" (overnight audit E-01)
+            return _err(400, "malformed request target")
         if self.allowed_hosts is not None and hdr.get("host", "").lower() not in self.allowed_hosts:
             return _err(421, "unexpected Host header (the cockpit only answers on its loopback address)")
         if path not in self.ROUTES:
@@ -2387,10 +2522,13 @@ class CockpitApp:
             return _err(403, "POST /api/run needs the header X-SUTRA-Action: run")
         origin = hdr.get("origin")
         if origin:
-            onet = urlsplit(origin).netloc.lower()
+            try:
+                onet = urlsplit(origin).netloc.lower()
+            except ValueError:   # e.g. "Origin: http://[x" (overnight audit E-09)
+                return _err(403, "malformed Origin header")
             if self.allowed_hosts is not None:
                 same = onet in self.allowed_hosts
-            else:   # wildcard bind or in-process client: the page must come from the host it is talking to
+            else:   # in-process client (no Host pinning): the page must come from the host it is talking to
                 same = bool(onet) and onet == hdr.get("host", "").lower()
             if not same:
                 return _err(403, "cross-origin pipeline runs are refused")
@@ -2454,7 +2592,11 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 if n:
                     self.rfile.read(n)
-                resp = app.dispatch(self.command, self.path, dict(self.headers.items()))
+                try:   # no request may end without a response (overnight audit E-01)
+                    resp = app.dispatch(self.command, self.path, dict(self.headers.items()))
+                except Exception as e:
+                    traceback.print_exc()
+                    resp = _err(500, f"{type(e).__name__}: {e}")
         try:
             self.send_response(resp.status)
             self.send_header("Content-Type", resp.ctype)
@@ -2469,9 +2611,54 @@ class _Handler(BaseHTTPRequestHandler):
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _handle  # type: ignore[assignment]
 
+    # C0 controls, DEL and C1 controls from the request line are written escaped, never raw (overnight audit
+    # E-10: an ESC sequence in a request could clear or recolour the console or forge log lines).
+    _LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))}
+
     def log_message(self, fmt: str, *args: Any) -> None:
         if not self.quiet:
-            sys.stderr.write("  %s  %s\n" % (self.log_date_time_string(), fmt % args))
+            msg = (fmt % args).translate(self._LOG_ESCAPES)
+            sys.stderr.write("  %s  %s\n" % (self.log_date_time_string(), msg))
+
+
+_ON_WINDOWS = os.name == "nt"
+
+
+def _exclusive_bind_options(sock: socket.socket) -> None:
+    """On Windows, claim the port exclusively: SO_REUSEADDR there lets a second socket bind a port that is
+    already listening (overnight audit E-05), so a second cockpit must fail instead of sharing the port."""
+    if _ON_WINDOWS:
+        excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if excl is not None:
+            sock.setsockopt(socket.SOL_SOCKET, excl, 1)
+
+
+def _host_family(host: str) -> int:
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
+def _bind_host(host: str) -> str:
+    """'' means every IPv4 interface; '[::1]' is accepted for '::1'."""
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host or "0.0.0.0"
+
+
+def _cockpit_url(host: str, port: int) -> str:
+    """The URL a browser on this laptop should open (IPv6 literals in brackets, wildcards as loopback)."""
+    h = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    return f"http://{'[' + h + ']' if ':' in h else h}:{port}/"
+
+
+def _probe_port(host: str, port: int) -> None:
+    """Fail now, with an OSError, when host:port cannot be bound (used before the Flask engine starts)."""
+    with socket.socket(_host_family(host), socket.SOCK_STREAM) as so:
+        if _ON_WINDOWS:
+            _exclusive_bind_options(so)
+        else:
+            so.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # what Werkzeug does on POSIX
+        so.bind((host, port))
 
 
 class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -2479,6 +2666,14 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     daemon_threads = True
     max_threads = MAX_HANDLER_THREADS
+
+    def server_bind(self) -> None:
+        if _ON_WINDOWS:   # never SO_REUSEADDR on Windows: see _exclusive_bind_options()
+            self.allow_reuse_address = False
+            if hasattr(self, "allow_reuse_port"):
+                self.allow_reuse_port = False
+            _exclusive_bind_options(self.socket)
+        super().server_bind()
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -2503,7 +2698,11 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 def make_stdlib_server(app: CockpitApp, host: str, port: int, quiet: bool = False) -> ThreadingHTTPServer:
     handler = type("SutraHandler", (_Handler,), {"quiet": quiet})
-    srv = _BoundedThreadingHTTPServer((host, port), handler)
+    host = _bind_host(host)
+    cls = _BoundedThreadingHTTPServer
+    if _host_family(host) == socket.AF_INET6:   # --host ::1 / :: (overnight audit E-07)
+        cls = type("_BoundedThreadingHTTPServer6", (_BoundedThreadingHTTPServer,), {"address_family": socket.AF_INET6})
+    srv = cls((host, port), handler)
     srv.app = app  # type: ignore[attr-defined]
     return srv
 
@@ -2547,33 +2746,47 @@ def choose_backend(pref: str) -> str:
 
 
 def serve(app: CockpitApp, host: str, port: int, backend: str, open_browser: bool) -> int:
-    backend = choose_backend(backend)
-    app.backend = backend
-    app.set_bind(host, port)
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"WARNING: binding to {host} exposes the cockpit beyond this laptop.")
-    print("Running Sectors A -> B -> C -> D ...")
-    run = app.execute()
-    st = run["views"]["status"]
-    print(f"  run #{run['run_id']} in {st['pipeline_seconds']:.2f} s · readiness {st['readiness']} · "
-          f"schema gates {st['health']}")
-    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/"
-    print(f"SUTRA-Trace cockpit ({backend}) on {url}  ·  Ctrl+C to stop")
-    if open_browser:
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    try:
+    srv: Optional[ThreadingHTTPServer] = None
+    try:   # the run folder is removed however serve() ends, even on a failed or interrupted first run (E-08)
+        backend = choose_backend(backend)
+        app.backend = backend
+        host = _bind_host(host)
+        app.set_bind(host, port)
+        # Bind (or, for Flask, probe) the port before the pipeline runs and before the URL is printed or a
+        # browser is opened, so a taken port or an unusable address fails at once (overnight audit E-07).
+        if backend == "flask":
+            _probe_port(host, port)
+            if _ON_WINDOWS:   # Werkzeug sets SO_REUSEADDR, which on Windows can share a listening port (E-05)
+                try:
+                    import werkzeug.serving as _wz  # type: ignore
+                    _wz.BaseWSGIServer.allow_reuse_address = False
+                except Exception:  # pragma: no cover - Werkzeug layout changed; the probe above still ran
+                    pass
+        else:
+            srv = make_stdlib_server(app, host, port)
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            print(f"WARNING: binding to {host} exposes the cockpit beyond this laptop.")
+        print("Running Sectors A -> B -> C -> D ...")
+        run = app.execute()
+        st = run["views"]["status"]
+        print(f"  run #{run['run_id']} in {st['pipeline_seconds']:.2f} s · readiness {st['readiness']} · "
+              f"schema gates {st['health']}")
+        url = _cockpit_url(host, port)
+        print(f"SUTRA-Trace cockpit ({backend}) on {url}  ·  Ctrl+C to stop")
+        if open_browser:
+            timer = threading.Timer(0.8, lambda: webbrowser.open(url))
+            timer.daemon = True
+            timer.start()
         if backend == "flask":
             fl = make_flask_app(app)
             fl.run(host=host, port=port, threaded=True, use_reloader=False, debug=False)
         else:
-            srv = make_stdlib_server(app, host, port)
-            try:
-                srv.serve_forever()
-            finally:
-                srv.server_close()
+            srv.serve_forever()  # type: ignore[union-attr]
     except KeyboardInterrupt:
         pass
     finally:
+        if srv is not None:
+            srv.server_close()
         app.close()
     return 0
 
@@ -2651,7 +2864,11 @@ def _self_test(workdir: Optional[str], backend_pref: str = "auto", keep: bool = 
         print(f"  {e}")
         return 2
 
-    app = CockpitApp(workdir, keep=keep)
+    try:
+        app = CockpitApp(workdir, keep=keep)
+    except OSError as e:   # e.g. --workdir names a file (overnight audit E-08)
+        print(f"  cannot use the work folder: {e}")
+        return 2
     app.backend = backend
     client: Optional[_Client] = None
     bodies: Dict[str, str] = {}
@@ -3103,7 +3320,320 @@ def _self_test(workdir: Optional[str], backend_pref: str = "auto", keep: bool = 
         if not ok:
             print(f"  FAILED {n}. {name}: {detail}")
     print(f"{passed}/{total} checks passed  ·  {time.perf_counter() - t_start:.2f} s")
-    return 0 if passed == total == EXPECTED_CHECKS else 1
+    reg_passed, reg_total = _overnight_audit_checks(keep)
+    return 0 if passed == total == EXPECTED_CHECKS and reg_passed == reg_total > 0 else 1
+
+
+def _overnight_audit_checks(keep: bool = False) -> Tuple[int, int]:
+    """
+    Regression checks for the overnight audit of this file (findings E-01 ... E-12, E-SIG01; E-ESC01 is
+    E-06). Each one failed on the code before its fix. Runs on its own pipeline run in a fresh shared work
+    folder, after the 39 numbered checks, and returns (passed, total).
+    """
+    import contextlib
+    results: List[Tuple[str, bool, str]] = []
+
+    def check(fid: str, name: str, fn: Callable[[], Tuple[Any, str]]) -> None:
+        try:
+            ok, detail = fn()
+            ok = bool(ok)
+        except Exception as e:  # a crash is a failed check, never a silent pass
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        results.append((f"{fid}: {name}", ok, detail))
+        print(f"  [{'PASS' if ok else 'FAIL'}] {fid:<7} {name}" + (f"  ({detail})" if detail else ""))
+
+    print("\nOvernight audit regression checks")
+    root = tempfile.mkdtemp(prefix="sutra_cockpit_audit_")
+    apps: List[CockpitApp] = []
+    try:
+        app = CockpitApp(root)
+        apps.append(app)
+        run = app.execute()
+
+        def raw(port: int, data: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=20) as so:
+                so.sendall(data)
+                buf = b""
+                while True:
+                    got = so.recv(65536)
+                    if not got:
+                        return buf
+                    buf += got
+
+        def r_e01():
+            srv = make_stdlib_server(app, "127.0.0.1", 0, quiet=True)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            old_err, sys.stderr = sys.stderr, io.StringIO()
+            try:
+                d = app.dispatch("GET", "http://[x/api/status", {})
+                r1 = raw(port, b"GET http://[x/api/status HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n" % port)
+
+                def boom(*_a: Any, **_k: Any) -> Response:
+                    raise RuntimeError("simulated route failure")
+                app.dispatch = boom  # type: ignore[assignment]
+                try:
+                    r2 = raw(port, b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n" % port)
+                finally:
+                    del app.dispatch
+            finally:
+                sys.stderr = old_err
+                srv.shutdown()
+                srv.server_close()
+            return (d.status == 400 and r1.startswith(b"HTTP/1.1 400") and r2.startswith(b"HTTP/1.1 500"),
+                    f"dispatch {d.status}; raw 'GET http://[x/...' -> {r1[:12].decode('latin-1') or 'no reply'}; "
+                    f"a route that raises -> {r2[:12].decode('latin-1') or 'no reply'}")
+        check("E-01", "A malformed request target gets 400; no request ends without a response", r_e01)
+
+        def r_e02():
+            insp = run["inspectors"]["PC"]
+            fname = "victim_disk.img"
+            vault, manifest, path = insp.vaults[fname]
+            ln = min(os.path.getsize(path), MAX_ANCHOR_READ)
+            prov = {"source_file": fname, "byte_offset": 0, "length": ln,
+                    "sha256": _sha256_hex(_read_range(path, 0, ln) or b"")}
+            aid = insp.inspect(prov)["anchor_id"]
+            wb = vault.write_blocker
+            opens = [0]
+            real_open = wb.open_read_only
+
+            def counting(p: str) -> int:
+                opens[0] += 1
+                return real_open(p)
+            wb.open_read_only = counting
+            try:
+                t0 = time.perf_counter()
+                out = insp.inspect_live(aid)
+                dt = time.perf_counter() - t0
+            finally:
+                del wb.open_read_only
+            m = out["merkle"]  # type: ignore[index]
+            idxs = sorted({0, 1, m["needed"] // 2, m["needed"] - 1})
+            same = insp._proofs_for(fname, idxs, cache=False) == [vault.prove_sub_block(path, manifest, i) for i in idxs]
+            chunks = len(m["chunks_spanned"])
+            return (out["status"] == "VERIFIED" and m["proved"] == m["needed"] > 512 and opens[0] == chunks and same,  # type: ignore[index]
+                    f"{ln:,} B anchor: {m['proved']}/{m['needed']} sub-blocks proved with {opens[0]} chunk read(s) "
+                    f"for {chunks} chunk(s) in {dt:.2f} s; proofs identical to prove_sub_block(): {same}")
+        check("E-02", "Proving an anchor reads and hashes each 4 MB chunk once, not once per sub-block", r_e02)
+
+        def r_e03():
+            insp = run["inspectors"]["HANDSET"]
+            aid = next(a for a, p in insp._index.items() if str(p.get("source_file") or "") in insp.vaults)
+            log = insp.vaults[str(insp._index[aid].get("source_file"))][0].write_blocker.log
+            n0 = len(log)
+            outs = [insp.inspect_live(aid) for _ in range(50)]
+            return (len(log) == n0 and all(o and o["status"] == "VERIFIED" for o in outs),
+                    f"write-blocker log {n0} -> {len(log)} entries after 50 live re-verifications")
+        check("E-03", "Live re-verification does not grow Sector A's write-blocker log", r_e03)
+
+        def r_e04():
+            other = CockpitApp(root)
+            apps.append(other)
+            run_b = other.execute()
+            insp = run["inspectors"]["HANDSET"]
+            aid = next(a for a, p in insp._index.items() if str(p.get("source_file") or "") in insp.vaults)
+            live = insp.inspect_live(aid)
+            return (run["workdir"] != run_b["workdir"] and os.path.isdir(run["workdir"])
+                    and os.path.isfile(run["handset"]["image"]) and live is not None and live["status"] == "VERIFIED",
+                    f"two cockpits on one --workdir: {os.path.relpath(run['workdir'], root)} and "
+                    f"{os.path.relpath(run_b['workdir'], root)}; the first one's live check after the second ran: "
+                    f"{live and live['status']}")
+        check("E-04", "Each process keeps its own run folders under a shared --workdir", r_e04)
+
+        def r_e05():
+            global _ON_WINDOWS
+            was = globals().get("_ON_WINDOWS", os.name == "nt")
+            _ON_WINDOWS = True    # simulate Windows: SO_REUSEADDR must not be set there
+            try:
+                s1 = make_stdlib_server(app, "127.0.0.1", 0, quiet=True)
+                win = s1.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+                s1.server_close()
+            finally:
+                _ON_WINDOWS = was
+            s2 = make_stdlib_server(app, "127.0.0.1", 0, quiet=True)
+            here = s2.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+            s2.server_close()
+            return (win == 0 and (here != 0) == (os.name != "nt"),
+                    f"SO_REUSEADDR with Windows simulated: {win}; on this {os.name} host: {here}")
+        check("E-05", "On Windows the stdlib engine never binds with SO_REUSEADDR", r_e05)
+
+        def r_e06():
+            det = _sector_b.FinancialMuleDetector()
+            a = det.bridge_affinity({"epoch": 1000, "amount_inr": 59000}, {"epoch": 990, "amount_usdt": 665.2})
+            b2 = json.loads(json.dumps(run["handset"]["b"]))
+            lead = next(l for l in b2["symbolic_anchors"] if l.get("threat_category") == "CROSS_CHAIN_BRIDGE")
+            lead["lead_details"]["delta_t_s"] = a["delta_t_s"]
+            view = triage_view(dict(run, handset=dict(run["handset"], b=b2)))
+            row = next(r for r in view["cross_chain_bridge"] if r["lead_id"] == lead["lead_id"])
+            return (a["affinity"] > 0 and row["within_escrow_window"] is True
+                    and row["escrow_window_bounds_s"] == [-det.CLOCK_SKEW_S, det.TAU_ESCROW_S],
+                    f"Sector B matches dt {a['delta_t_s']} s (affinity {a['affinity']}); cockpit window "
+                    f"{row.get('escrow_window_bounds_s')} -> within {row['within_escrow_window']}")
+        check("E-06", "The cockpit escrow window is Sector B's [-clock skew, tau_escrow]", r_e06)
+
+        def r_e07():
+            fmt_ok = (_cockpit_url("::1", 5077) == "http://[::1]:5077/" and _cockpit_url("0.0.0.0", 80) ==
+                      "http://127.0.0.1:80/" and _bind_host("") == "0.0.0.0" and _bind_host("[::1]") == "::1"
+                      and _host_family("::1") == socket.AF_INET6)
+            v6 = "IPv6 not available on this host"
+            try:
+                socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+                s6 = make_stdlib_server(app, "::1", 0, quiet=True)
+                v6 = f"bound {s6.server_address[0]} port {s6.server_address[1]}"
+                s6.server_close()
+            except OSError as e:
+                if not isinstance(e, socket.gaierror) and getattr(e, "errno", None) in (97, 99, 10047, 10049):
+                    v6 = "IPv6 not available on this host"
+                else:
+                    raise
+            fails = []
+            hold = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            hold.bind(("127.0.0.1", 0))
+            hold.listen(1)
+            port = hold.getsockname()[1]
+            calls: List[str] = []
+            real_open = webbrowser.open
+            webbrowser.open = lambda *a, **k: calls.append("browser") or True  # type: ignore[assignment]
+            try:
+                for be in ["stdlib"] + (["flask"] if _flask is not None else []):
+                    probe = CockpitApp()
+
+                    def no_run() -> Dict[str, Any]:
+                        calls.append("pipeline")
+                        raise RuntimeError("the pipeline ran before the port was bound")
+                    probe.execute = no_run  # type: ignore[assignment]
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            serve(probe, "127.0.0.1", port, be, True)
+                        fails.append(f"{be}: no error")
+                    except OSError:
+                        pass
+                    except Exception as e:
+                        fails.append(f"{be}: {type(e).__name__}: {e}")
+                    finally:
+                        probe.close()
+            finally:
+                webbrowser.open = real_open  # type: ignore[assignment]
+                hold.close()
+            return (fmt_ok and not fails and not calls,
+                    f"URL/host forms ok: {fmt_ok}; ::1 {v6}; taken port refused before the pipeline or a "
+                    f"browser: {not fails and not calls}{' ' + '; '.join(fails) if fails else ''}")
+        check("E-07", "IPv6 hosts bind and print as URLs; the port is bound before the run and browser", r_e07)
+
+        def r_e08():
+            probe = CockpitApp()
+
+            def interrupted() -> Dict[str, Any]:
+                raise KeyboardInterrupt
+            probe.execute = interrupted  # type: ignore[assignment]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_serve = serve(probe, "127.0.0.1", 0, "stdlib", False)
+            except KeyboardInterrupt:
+                rc_serve = "KeyboardInterrupt escaped"
+            leaked = os.path.isdir(probe.base)
+            probe.close()
+            real_serve = globals()["serve"]
+
+            def failing_serve(a: CockpitApp, *_x: Any) -> int:
+                a.close()
+                raise ValueError("a sector raised a non-OSError")
+            globals()["serve"] = failing_serve
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    rc_main = _main(["--serve", "--no-browser", "--port", "5099"])
+            finally:
+                globals()["serve"] = real_serve
+            afile = os.path.join(root, "afile")
+            with open(afile, "w", encoding="utf-8") as f:
+                f.write("x")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_self = _self_test(afile)
+            msg = err.getvalue().strip()
+            return (rc_serve == 0 and not leaked and rc_main == 2 and msg.startswith("cannot start the cockpit:")
+                    and "Traceback" not in msg and rc_self == 2,
+                    f"interrupted first run: serve -> {rc_serve}, temp folder left: {leaked}; sector ValueError: "
+                    f"_main -> {rc_main} '{msg}'; --workdir is a file: self-test -> {rc_self}")
+        check("E-08", "A failed or interrupted start cleans up and ends in one line, not a traceback", r_e08)
+
+        def r_e09():
+            before = app.run["run_id"]  # type: ignore[index]
+            r = app.dispatch("POST", "/api/run", {"X-SUTRA-Action": "run", "Origin": "http://[x", "Host": "127.0.0.1:5000"})
+            return (r.status == 403 and app.run["run_id"] == before,  # type: ignore[index]
+                    f"Origin 'http://[x' -> {r.status}; no pipeline run started")
+        check("E-09", "A malformed Origin on POST /api/run is refused with 403", r_e09)
+
+        def r_e10():
+            h = object.__new__(_Handler)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                h.log_message('"%s" %s %s', "GET /\x1b[2J\x1b[31mFAKE-LOG-LINE\x1b[0m\x9b HTTP/1.1", "404", "-")
+            out = err.getvalue()
+            return ("\x1b" not in out and "\x9b" not in out and "\\x1b[2J" in out,
+                    "logged as " + out.strip().split("  ", 1)[-1])
+        check("E-10", "Request-line control characters are escaped in the console log", r_e10)
+
+        def r_e11():
+            saved = app.allowed_hosts
+            before = app.run["run_id"]  # type: ignore[index]
+            try:
+                app.set_bind("0.0.0.0", 5000)
+                bad = "rebind.attacker.example:5000"
+                s1 = app.dispatch("GET", "/api/vault", {"Host": bad}).status
+                s2 = app.dispatch("POST", "/api/run", {"Host": bad, "Origin": f"http://{bad}",
+                                                       "X-SUTRA-Action": "run"}).status
+                s3 = app.dispatch("GET", "/api/status", {"Host": "127.0.0.1:5000"}).status
+                hn = socket.gethostname().lower()
+                s4 = app.dispatch("GET", "/api/status", {"Host": f"{hn}:5000"}).status if hn else 200
+            finally:
+                app.allowed_hosts = saved
+            return (s1 == 421 and s2 == 421 and s3 == 200 and s4 == 200 and app.run["run_id"] == before,  # type: ignore[index]
+                    f"--host 0.0.0.0: rebound Host GET {s1}, POST /api/run {s2}; 127.0.0.1 {s3}; "
+                    f"this machine's name {s4}")
+        check("E-11", "A wildcard bind still refuses a DNS-rebound Host header (421)", r_e11)
+
+        def r_e12():
+            insp = run["inspectors"]["PC"]
+            gone = os.path.join(root, "no_such_image.img")
+            other = next(n for n in insp.roots if n not in insp.vaults)
+            insp2 = AnchorInspector("PC", dict(insp.roots, **{"victim_disk.img": gone, other: gone}), insp.vaults)
+            o1 = insp2.inspect({"source_file": "victim_disk.img", "byte_offset": 0, "length": 64, "sha256": "0" * 64})
+            o2 = insp2.inspect({"source_file": other, "byte_offset": 0, "length": 64, "sha256": "0" * 64})
+            return (o1["status"] == "FAILED" and o1["rehash"] == "UNREADABLE" and o1["merkle"]["status"] == "NOT_EVALUATED"
+                    and o2["merkle"]["status"] == "NOT_IN_VAULTED_IMAGE",
+                    f"vaulted image missing: {o1['status']} / rehash {o1['rehash']} / Merkle {o1['merkle']['status']}; "
+                    f"other source missing: Merkle {o2['merkle']['status']}")
+        check("E-12", "A missing vaulted image is reported as not evaluated, not as another file", r_e12)
+
+        def r_sig():
+            a2 = json.loads(json.dumps(run["handset"]["a"]))
+            seal = a2["bnss_verification"]["sec_106_malkhana_seal_ledger"]
+            seal["signatures"] = {
+                "field": {"signer_id": "SI-X", "algorithm": "Ed25519", "public_key_hex": "11" * 32,
+                          "signature_hex": "22" * 64, "status": "INVALID"},
+                "malkhana": {"signer_id": "HC-Y", "algorithm": "Ed25519", "public_key_hex": "33" * 32,
+                             "signature_hex": "44" * 64, "status": "VALID"}}
+            v = vault_view(dict(run, handset=dict(run["handset"], a=a2)))
+            ch = v["seal_chain"]
+            return (ch[0]["signed"] is False and ch[0]["signature_status"] == "INVALID" and ch[1]["signed"] is True
+                    and ch[2]["signed"] is False and "field INVALID" in v["seal_signatures"],
+                    f"signed {[c['signed'] for c in ch]}; officer signatures: {v['seal_signatures']}")
+        check("E-SIG01", "A s.106 milestone counts as signed only when Sector A verified it VALID", r_sig)
+    except Exception as e:  # the group itself could not run: that is a failure, never a silent pass
+        results.append(("overnight audit group", False, f"{type(e).__name__}: {e}"))
+        print(f"  [FAIL] overnight audit group could not run: {type(e).__name__}: {e}")
+    finally:
+        for a in apps:
+            a.close()
+        if not keep:
+            shutil.rmtree(root, ignore_errors=True)
+    passed = sum(1 for _, ok, _ in results if ok)
+    for name, ok, detail in results:
+        if not ok:
+            print(f"  FAILED {name}: {detail}")
+    print(f"{passed}/{len(results)} overnight audit regression checks passed")
+    return passed, len(results)
 
 
 def gr_label(ex: Dict[str, Any], node_id: str) -> str:
@@ -3137,8 +3667,13 @@ def _main(argv: Sequence[str]) -> int:
             _require_sectors()
             return serve(CockpitApp(args.workdir, keep=args.keep), args.host, port, args.backend,
                          not args.no_browser)
+        except KeyboardInterrupt:
+            return 130
         except (CockpitError, OSError) as e:
             print(f"cannot start the cockpit: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:   # a sector's own error: one line, never a traceback (overnight audit E-08)
+            print(f"cannot start the cockpit: {type(e).__name__}: {e}", file=sys.stderr)
             return 2
     return _self_test(args.workdir, args.backend, args.keep)
 
